@@ -27,7 +27,6 @@ android {
 
     kotlinOptions { jvmTarget = "17" }
 
-    // Evita conflitti tra le librerie native C++ durante la creazione dell'APK
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -40,23 +39,19 @@ android {
 }
 
 dependencies {
-    // Librerie base Android e Kotlin Coroutines
+    // 1. Librerie Ufficiali Google & Kotlin Coroutines (Per Socket TCP/UDP di eMule e IRC/XDCC)
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-    // OkHttp (GZIP nativo per server.met e nodes.dat)
+    // 2. OkHttp Ufficiale (Con GZIP nativo per scaricare server.met e nodes.dat)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // LibVLC Stabile (Anteprime file .part)
+    // 3. LibVLC Ufficiale (Per le anteprime video dei file .part incompleti)
     implementation("org.videolan.android:libvlc-all:3.5.1")
 
-    // Motore BitTorrent via JitPack (Libtorrent4j)
-    implementation("com.github.aldenml:libtorrent4j:2.1.0-31")
-
-    // Motore Rete IRC / XDCC compilato direttamente dal codice ufficiale via JitPack!
-    implementation("com.github.pircbotx:pircbotx:2.4")
-    implementation("com.google.guava:guava:32.1.3-android")
-    implementation("org.slf4j:slf4j-android:1.7.36")
+    // 4. Motore BitTorrent Ufficiale su Maven Central (Verificato nei log #2 e #4!)
+    implementation("org.libtorrent4j:libtorrent4j:2.1.0-31")
+    implementation("org.libtorrent4j:libtorrent4j-android-arm64:2.1.0-31")
 }
