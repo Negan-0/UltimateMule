@@ -42,7 +42,7 @@ class P2PEngineService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        startProtectedForeground("Reti KAD | Server eD2K | IRC | Torrent pronte")
+        startProtectedForeground("Servizio P2P attivo: KAD | eD2K | IRC | Torrent")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -59,10 +59,10 @@ class P2PEngineService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Stato Coda e Download UltimateMule",
-                NotificationManager.IMPORTANCE_DEFAULT // Visibile su Android 16!
+                "Servizio Background UltimateMule",
+                NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
-                description = "Mostra lo stato di connessione KAD, Server e velocità di download"
+                description = "Mantiene attiva la coda e mostra lo stato delle reti P2P"
                 setSound(null, null)
                 enableVibration(false)
             }
@@ -76,7 +76,7 @@ class P2PEngineService : Service() {
         )
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("🐴 UltimateMule P2P Attivo")
+            .setContentTitle("UltimateMule P2P")
             .setContentText(statusText)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentIntent(pendingIntent)
