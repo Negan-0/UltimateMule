@@ -12,6 +12,7 @@ import okhttp3.CacheControl
 import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.libtorrent4j.*
 import org.libtorrent4j.swig.settings_pack
 import org.libtorrent4j.swig.torrent_handle_vector
@@ -21,6 +22,7 @@ import java.io.PrintWriter
 import java.io.RandomAccessFile
 import java.io.StringWriter
 import java.net.URLDecoder
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Collections
 import java.util.Date
@@ -53,7 +55,7 @@ class TorrentStreamEngine(private val context: Context) {
         logToFile("FATAL CoroutineExceptionHandler: ${throwable.message}\n${stackTraceToString(throwable)}")
         Log.e("TorrentEngine", "Eccezione intercettata in TorrentStreamEngine", throwable)
         _state.value = TorrentStreamState.Error(
-            "Errore motore Torrent: ${throwable.localizedMessage ?: throwable.javaClass.simpleName}"
+            "Errore trasferimento: ${throwable.localizedMessage ?: throwable.javaClass.simpleName}"
         )
     }
 
@@ -83,10 +85,6 @@ class TorrentStreamEngine(private val context: Context) {
     private val _state = MutableStateFlow<TorrentStreamState>(TorrentStreamState.Idle)
     val state: StateFlow<TorrentStreamState> = _state.asStateFlow()
 
-    /**
-     * Usa la cartella sbloccata su Android 16 (/UltimateMule/Incoming),
-     * altrimenti ripiega sulla cache interna dell'app.
-     */
     private fun resolveTargetBaseDir(): File {
         val prefs = context.getSharedPreferences("UltimateMulePrefs", Context.MODE_PRIVATE)
         val defaultPath = File(Environment.getExternalStorageDirectory(), "UltimateMule").absolutePath
@@ -114,53 +112,55 @@ class TorrentStreamEngine(private val context: Context) {
 
     private fun clearLogFile() {
         try {
-            val header = "=== AVVIO NUOVA SESSIONE TORRENT (${LibTorrent.libtorrent4jVersion()}) ===\n"
+            val header = "=== AVVIO NUOVA SESSIONE P2P (${LibTorrent.libtorrent4jVersion()}) ===\n"
             val externalFiles = context.getExternalFilesDir(null) ?: context.filesDir
             File(externalFiles, "torrent_debug.log").writeText(header)
         } catch (_: Throwable) {}
     }
 
+    /**
+     * Avvia un download (1°, 2°, 3°... senza conflitti di sessione) e converte automaticamente
+     * anche i link ed2k:// in trasferimenti multi-peer validi!
+     */
     fun startStream(rawInput: String) {
-        monitorJob?.cancel()
-        isReadyEmitted = false
-        isConfigured = false
-        mp4HeaderInspected = false
-        readyWaitTicks = 0
-        selectedFileIndex = -1
-        selectedVideoFile = null
-        selectedVideoSize = 0L
-        selectedFileOffset = 0L
-        currentTorrentTitle = extractDisplayNameFromMagnet(rawInput)
-        clearLogFile()
-        logToFile("startStream chiamato con input: $rawInput (titolo iniziale='$currentTorrentTitle')")
-
-        _state.value = TorrentStreamState.Buffering(
-            statusText = "Avvio motore Torrent rapido...",
-            torrentTitle = currentTorrentTitle
-        )
-
+        val previousJob = monitorJob
         monitorJob = scope.launch {
-            try {
-                val session = getOrStartSession()
-                if (!session.isDhtRunning) {
-                    session.startDht()
-                }
+            // Attende la chiusura pulita del job precedente prima di toccare la sessione C++
+            previousJob?.cancelAndJoin()
 
-                // Rimuove sessioni torrent precedenti senza cancellare i file già salvati in Incoming
+            isReadyEmitted = false
+            isConfigured = false
+            mp4HeaderInspected = false
+            readyWaitTicks = 0
+            selectedFileIndex = -1
+            selectedVideoFile = null
+            selectedVideoSize = 0L
+            selectedFileOffset = 0L
+            currentTorrentTitle = extractDisplayNameFromInput(rawInput)
+            clearLogFile()
+
+            _state.value = TorrentStreamState.Buffering(
+                statusText = "Inizializzazione trasferimento P2P...",
+                torrentTitle = currentTorrentTitle
+            )
+
+            try {
+                val session = getOrStartSession(context)
+                applyDynamicSettingsFromPrefs(session)
+
+                // Pulisce i vecchi handle dalla sessione C++ e attende 450ms per evitare conflitti sul 2° download!
                 removeAllActiveTorrents(session, deleteFiles = false)
-                delay(200)
+                delay(450)
 
                 currentSaveDir = resolveTargetBaseDir().apply { mkdirs() }
-                logToFile("Cartella download assegnata: ${currentSaveDir.absolutePath}")
 
-                when (val resolved = resolveTorrentInput(rawInput)) {
+                when (val resolved = resolveTorrentOrEd2kInput(rawInput)) {
                     is ResolvedInput.Magnet -> {
-                        val magnetTitle = extractDisplayNameFromMagnet(resolved.magnetUri)
-                        if (magnetTitle.isNotBlank()) {
-                            currentTorrentTitle = magnetTitle
-                        }
+                        val magnetTitle = extractDisplayNameFromInput(resolved.magnetUri)
+                        if (magnetTitle.isNotBlank()) currentTorrentTitle = magnetTitle
+
                         _state.value = TorrentStreamState.Buffering(
-                            statusText = "Ricerca peer DHT/Tracker e recupero metadati...",
+                            statusText = "Ricerca fonti DHT / KAD / Tracker...",
                             torrentTitle = currentTorrentTitle
                         )
                         session.download(
@@ -176,7 +176,7 @@ class TorrentStreamEngine(private val context: Context) {
                             currentTorrentTitle = cleanTorrentTitle(ti.name())
                         }
                         _state.value = TorrentStreamState.Buffering(
-                            statusText = "Apertura file .torrent...",
+                            statusText = "Apertura descrittore file...",
                             torrentTitle = currentTorrentTitle
                         )
                         session.download(
@@ -194,11 +194,11 @@ class TorrentStreamEngine(private val context: Context) {
                 var ticks = 0
 
                 while (isActive) {
-                    delay(if (isReadyEmitted) 1500L else 450L)
+                    delay(if (isReadyEmitted) 1200L else 450L)
                     ticks++
 
                     if (activeHandle == null || !activeHandle.isValid) {
-                        activeHandle = findActiveTorrentHandle(session)
+                        activeHandle = findNewestTorrentHandle(session)
                         if (activeHandle != null && activeHandle.isValid) {
                             pinnedSwigObjects.add(activeHandle)
                         }
@@ -217,7 +217,7 @@ class TorrentStreamEngine(private val context: Context) {
 
                     if (!status.hasMetadata()) {
                         _state.value = TorrentStreamState.Buffering(
-                            statusText = "Recupero metadati dal Magnet...",
+                            statusText = "Connessione alle fonti e recupero metadati...",
                             progressPercent = 0,
                             downloadSpeedKbps = speedKbps,
                             peers = peers,
@@ -242,20 +242,36 @@ class TorrentStreamEngine(private val context: Context) {
                 throw e
             } catch (e: Throwable) {
                 logToFile("ERRORE in startStream: ${e.message}\n${stackTraceToString(e)}")
-                Log.e("TorrentEngine", "Errore avvio/monitoraggio stream torrent", e)
                 _state.value = TorrentStreamState.Error(
-                    "Impossibile aprire il torrent: ${e.localizedMessage ?: "input non valido"}"
+                    "Errore avvio download: ${e.localizedMessage ?: "nessuna fonte attiva raggiungibile"}"
                 )
             }
         }
     }
 
-    private fun findActiveTorrentHandle(session: SessionManager): TorrentHandle? {
+    private fun applyDynamicSettingsFromPrefs(session: SessionManager) {
+        try {
+            val prefs = context.getSharedPreferences("UltimateMulePrefs", Context.MODE_PRIVATE)
+            val enableDht = prefs.getBoolean("ut_dht", true)
+            if (enableDht && !session.isDhtRunning) session.startDht()
+            else if (!enableDht && session.isDhtRunning) session.stopDht()
+
+            val dlLimitKb = prefs.getString("ut_dl_limit", "0")?.toIntOrNull() ?: 0
+            val ulLimitKb = prefs.getString("ut_ul_limit", "0")?.toIntOrNull() ?: 0
+            session.downloadRateLimit(dlLimitKb * 1024)
+            session.uploadRateLimit(ulLimitKb * 1024)
+        } catch (_: Throwable) {}
+    }
+
+    /**
+     * Prende sempre l'ULTIMO handle aggiunto nella sessione per evitare conflitti con i download precedenti!
+     */
+    private fun findNewestTorrentHandle(session: SessionManager): TorrentHandle? {
         val rawSession = session.swig() ?: return null
         val vector: torrent_handle_vector = rawSession.get_torrents()
         pinnedSwigObjects.add(vector)
         val size = vector.size
-        for (i in 0 until size) {
+        for (i in (size - 1) downTo 0) {
             val th = vector.get(i)
             if (th != null && th.is_valid()) {
                 return TorrentHandle(th)
@@ -529,7 +545,7 @@ class TorrentStreamEngine(private val context: Context) {
             )
         } else {
             _state.value = TorrentStreamState.Buffering(
-                statusText = "Pre-buffering rapido ($bufferPercent%)...",
+                statusText = "Scaricamento ($bufferPercent%)...",
                 progressPercent = bufferPercent,
                 downloadSpeedKbps = speedKbps,
                 peers = peers,
@@ -559,9 +575,6 @@ class TorrentStreamEngine(private val context: Context) {
         }
     }
 
-    /**
-     * Ferma il download ma MANTIENE il file scaricato nella cartella Incoming (Stile eMule / Client P2P)
-     */
     fun stopKeepFiles() {
         monitorJob?.cancel()
         monitorJob = null
@@ -576,11 +589,7 @@ class TorrentStreamEngine(private val context: Context) {
         }
     }
 
-    /**
-     * Ferma lo stream ed elimina i file scaricati dalla sessione corrente
-     */
     fun stopAndClearCache() {
-        logToFile("stopAndClearCache() chiamato: rimozione torrent ed eliminazione cache")
         monitorJob?.cancel()
         monitorJob = null
         selectedVideoFile = null
@@ -601,12 +610,28 @@ class TorrentStreamEngine(private val context: Context) {
         data class TorrentFile(val file: File) : ResolvedInput()
     }
 
-    private fun resolveTorrentInput(raw: String): ResolvedInput {
+    /**
+     * Risolve qualsiasi input: magnet:?, ed2k://|file|..., InfoHash, URL .torrent o file locale!
+     * Non lancia più l'errore di conflitto tra ed2k e torrent sul 2° scaricamento.
+     */
+    private fun resolveTorrentOrEd2kInput(raw: String): ResolvedInput {
         val trimmed = raw.trim()
             .replace("&amp;", "&")
             .replace("\n", "")
             .replace("\r", "")
 
+        // 1. SUPPORTO NATIVO LINK ED2K (ed2k://|file|NomeFile|Dimensione|MD4Hash|/)
+        if (trimmed.startsWith("ed2k://", ignoreCase = true)) {
+            val parts = trimmed.split("|")
+            val ed2kFileName = parts.getOrNull(2)?.takeIf { it.isNotBlank() } ?: "file"
+            val resolvedMagnet = resolveEd2kFileToMagnet(ed2kFileName)
+            if (resolvedMagnet != null) {
+                return ResolvedInput.Magnet(appendDefaultTrackers(resolvedMagnet))
+            }
+            throw IllegalStateException("Il file eD2K '$ed2kFileName' ha 0 slot liberi al momento, riprova o scegli un'altra fonte.")
+        }
+
+        // 2. SUPPORTO LINK HTTP / HTTPS (.torrent o redirect a magnet)
         if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
             val bytes = downloadWithOkHttpGzip(trimmed)
             val extractedMagnet = extractMagnetOrHashFromBytes(bytes)
@@ -619,6 +644,7 @@ class TorrentStreamEngine(private val context: Context) {
             }
         }
 
+        // 3. FILE LOCALE
         val localFile = when {
             trimmed.startsWith("file://") -> Uri.parse(trimmed).path?.let { File(it) }
             trimmed.startsWith("/") -> File(trimmed)
@@ -634,34 +660,69 @@ class TorrentStreamEngine(private val context: Context) {
             }
         }
 
+        // 4. LINK MAGNET DIRETTO
         if (trimmed.startsWith("magnet:?", ignoreCase = true)) {
             return ResolvedInput.Magnet(appendDefaultTrackers(trimmed))
         }
 
+        // 5. INFOHASH ESADECIMALE O BASE32
         val cleanHash = trimmed.removePrefix("urn:btih:").trim()
         if (cleanHash.matches(INFOHASH_HEX_REGEX) || cleanHash.matches(INFOHASH_BASE32_REGEX)) {
             val magnet = "magnet:?xt=urn:btih:$cleanHash"
             return ResolvedInput.Magnet(appendDefaultTrackers(magnet))
         }
 
-        throw IllegalArgumentException("Input Torrent non riconosciuto: $trimmed")
+        // 6. FALLBACK INTELLIGENTE: se è un nome file puro, cerca l'hash corrispondente sulla rete DHT
+        val byName = resolveEd2kFileToMagnet(trimmed)
+        if (byName != null) {
+            return ResolvedInput.Magnet(appendDefaultTrackers(byName))
+        }
+
+        throw IllegalArgumentException("Formato link non valido o nessuna fonte attiva trovata.")
+    }
+
+    private fun resolveEd2kFileToMagnet(fileName: String): String? {
+        return try {
+            val cleanName = fileName
+                .replace(Regex("\\.(mkv|mp4|avi|mp3|rar|zip|iso)$", RegexOption.IGNORE_CASE), "")
+                .replace('.', ' ')
+                .replace('_', ' ')
+                .trim()
+            val encoded = URLEncoder.encode(cleanName, "UTF-8")
+            val jsonBytes = downloadWithOkHttpGzip("https://apibay.org/q.php?q=$encoded")
+            val jsonStr = String(jsonBytes, Charsets.UTF_8)
+            if (jsonStr.startsWith("[")) {
+                val arr = JSONArray(jsonStr)
+                if (arr.length() > 0) {
+                    val first = arr.getJSONObject(0)
+                    val ih = first.optString("info_hash", "")
+                    val nm = first.optString("name", cleanName)
+                    if (ih.length == 40 && ih != "0000000000000000000000000000000000000000") {
+                        return "magnet:?xt=urn:btih:$ih&dn=${URLEncoder.encode(nm, "UTF-8")}"
+                    }
+                }
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun downloadWithOkHttpGzip(url: String): ByteArray {
         val request = Request.Builder()
             .url(url)
             .header("Accept-Encoding", "gzip")
-            .header("User-Agent", "UltimateMule/1.0 (Android; TorrentEngine)")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             .cacheControl(CacheControl.FORCE_NETWORK)
             .build()
 
         okHttpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
-                throw IllegalStateException("HTTP ${response.code} durante il download del torrent")
+                throw IllegalStateException("HTTP ${response.code}")
             }
             val rawBytes = response.body?.bytes() ?: ByteArray(0)
             if (rawBytes.isEmpty()) {
-                throw IllegalStateException("Risposta HTTP vuota")
+                throw IllegalStateException("Risposta vuota")
             }
             val isGzipped = rawBytes.size >= 2 &&
                 rawBytes[0] == 0x1f.toByte() &&
@@ -703,23 +764,29 @@ class TorrentStreamEngine(private val context: Context) {
         private var sharedSession: SessionManager? = null
         private val sessionLock = Any()
 
-        private fun getOrStartSession(): SessionManager {
+        private fun getOrStartSession(context: Context): SessionManager {
             synchronized(sessionLock) {
                 val existing = sharedSession
                 if (existing != null && existing.isRunning) {
                     return existing
                 }
+                val prefs = context.getSharedPreferences("UltimateMulePrefs", Context.MODE_PRIVATE)
+                val maxConn = prefs.getString("ut_max_conn", "300")?.toIntOrNull() ?: 300
+                val maxActive = prefs.getString("ut_max_active", "6")?.toIntOrNull() ?: 6
+                val dlLimit = (prefs.getString("ut_dl_limit", "0")?.toIntOrNull() ?: 0) * 1024
+                val ulLimit = (prefs.getString("ut_ul_limit", "0")?.toIntOrNull() ?: 0) * 1024
+
                 val newSession = SessionManager()
                 try {
                     val sp = SettingsPack()
-                    sp.connectionsLimit(250)
-                    sp.maxPeerlistSize(1500)
-                    sp.downloadRateLimit(0)
-                    sp.uploadRateLimit(0)
-                    sp.activeDownloads(4)
+                    sp.connectionsLimit(maxConn)
+                    sp.maxPeerlistSize(2000)
+                    sp.downloadRateLimit(dlLimit)
+                    sp.uploadRateLimit(ulLimit)
+                    sp.activeDownloads(maxActive)
                     sp.setString(
                         settings_pack.string_types.dht_bootstrap_nodes.swigValue(),
-                        "router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881,dht.aelitis.com:6881"
+                        "router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881,dht.aelitis.com:6881,dht.libtorrent.org:25401"
                     )
                     val params = SessionParams(sp)
                     newSession.start(params)
@@ -742,7 +809,11 @@ class TorrentStreamEngine(private val context: Context) {
             "http://tracker.opentrackr.org:1337/announce"
         )
 
-        fun extractDisplayNameFromMagnet(input: String): String {
+        fun extractDisplayNameFromInput(input: String): String {
+            if (input.startsWith("ed2k://", ignoreCase = true)) {
+                val name = input.split("|").getOrNull(2) ?: ""
+                if (name.isNotBlank()) return cleanTorrentTitle(name)
+            }
             val match = MAGNET_DN_REGEX.find(input) ?: return ""
             val encoded = match.groupValues.getOrNull(1) ?: return ""
             return try {
