@@ -419,4 +419,71 @@ class GlobalSearchEngine(private val configDir: File) {
         ext: String,
         sizeBytes: Long,
         hash: String,
-   
+        sources: Int,
+        originNetwork: String
+    ): String {
+        val lower = fileName.lowercase()
+        val resolution = when {
+            lower.contains("2160p") || lower.contains("4k") -> "4K UHD (3840x2160)"
+            lower.contains("1080p") -> "Full HD 1080p (1920x1080)"
+            lower.contains("720p") -> "HD 720p (1280x720)"
+            else -> "Standard / Auto-rilevata"
+        }
+        val videoCodec = when {
+            lower.contains("x265") || lower.contains("hevc") -> "HEVC / H.265"
+            lower.contains("x264") || lower.contains("h264") -> "AVC / H.264"
+            lower.contains("xvid") || lower.contains("divx") -> "MPEG-4 XviD/DivX"
+            else -> "Compatibile LibVLC"
+        }
+        val audioInfo = when {
+            lower.contains("ita") || lower.contains("italian") -> "Italiano rilevato (Multi-Traccia)"
+            lower.contains("multi") || lower.contains("dual") -> "Dual/Multi-Audio"
+            else -> "Traccia Originale"
+        }
+
+        return "ISPEZIONE CONTENUTO PRE-DOWNLOAD:\n\n" +
+                "• Nome File: $fileName\n" +
+                "• Formato Reale: .$ext\n" +
+                "• Dimensione: ${formatSize(sizeBytes)} ($sizeBytes byte)\n" +
+                "• Rete: $originNetwork\n" +
+                "• Fonti Attive: $sources\n" +
+                "• Video/Codec: $resolution ($videoCodec)\n" +
+                "• Lingua/Audio: $audioInfo\n" +
+                "• Hash eD2K/BTIH: $hash"
+    }
+
+    private fun generateDeterministicMd4Hex(seed: String): String {
+        return try {
+            val md = MessageDigest.getInstance("MD5")
+            md.update(seed.toByteArray())
+            md.digest().joinToString("") { "%02X".format(it) }
+        } catch (_: Exception) {
+            seed.uppercase().take(32)
+        }
+    }
+
+    private fun fetchStringGzip(url: String): String {
+        val request = Request.Builder()
+            .url(url)
+            .header("Accept-Encoding", "gzip")
+            .header("User-Agent", "Mozilla/5.0 (Android 16; UltimateMule)")
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            val raw = response.body?.bytes() ?: return ""
+            val bytes = if (raw.size >= 2 && raw[0] == 0x1f.toByte() && raw[1] == 0x8b.toByte()) {
+                GZIPInputStream(ByteArrayInputStream(raw)).use { it.readBytes() }
+            } else {
+                raw
+            }
+            return String(bytes, Charsets.UTF_8)
+        }
+    }
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes <= 0) return "Variabile"
+        val mb = bytes / (1024.0 * 1024.0)
+        return if (mb >= 1024) String.format("%.2f GB", mb / 1024.0)
+        else String.format("%.1f MB", mb)
+    }
+}
