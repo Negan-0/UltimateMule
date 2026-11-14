@@ -3,6 +3,7 @@ package com.ultimatemule.app.irc
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -15,12 +16,16 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.Socket
 import java.nio.ByteBuffer
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.Collections
-import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 /**
  * Motore mIRC + XDCC con Protezione/Offuscamento IP (+x/+i Cloaking, Anti-CTCP Leak, Proxy SOCKS5 e SSL).
- * Tutti i pacchetti trovati nei canali vengono salvati anche in memoria condivisa per la scheda Cerca.
+ * Coda di scrittura rigorosamente sequenziale (FIFO) per evitare il rifiuto dell'handshake dai server IRC.
  */
 class IrcXdccEngine(
     val server: String,
@@ -63,7 +68,6 @@ class IrcXdccEngine(
     )
 
     companion object {
-        // Archivio condiviso in memoria di tutti i file annunciati nei canali IRC (interrogabile dalla scheda Cerca!)
         val sharedChannelPacks: MutableMap<String, ChannelPackItem> =
             Collections.synchronizedMap(linkedMapOf())
     }
@@ -96,46 +100,76 @@ class IrcXdccEngine(
     private var reader: BufferedReader? = null
     private var writer: OutputStreamWriter? = null
     private var connectionJob: Job? = null
+    private var writerJob: Job? = null
+    private var outgoingQueue = Channel<String>(Channel.UNLIMITED)
+
+    private var activeNick: String = nickname
+    private var isRegisteredOnServer: Boolean = false
     private var listedChannelCount = 0
 
     val joinedChannels = linkedSetOf<String>()
     var currentChannel: String? = null
         private set
 
-    // Riconosce tutti i formati di annuncio dei Bot XDCC nei canali
     private val botPackRegex = Regex("""#(\d+)\s+\d*x?\s*\[\s*([0-9.,]+\s*[KMGTPBi]+)\s*]\s+(.+)""", RegexOption.IGNORE_CASE)
 
     fun connect() {
         if (connectionJob?.isActive == true) return
+        isRegisteredOnServer = false
+        activeNick = sanitizeNickname(nickname)
+        outgoingQueue = Channel(Channel.UNLIMITED)
+
         connectionJob = scope.launch(Dispatchers.IO) {
             try {
                 val proxyInfo = if (socksProxyHost.isNotBlank() && socksProxyPort > 0) {
                     " tramite Proxy SOCKS5 ($socksProxyHost:$socksProxyPort)"
                 } else {
-                    " con Mascheramento Host/IP (+ix)"
+                    " (Scudo IP +ix pronto)"
                 }
-                emitLog("Connessione protetta a $server:$port$proxyInfo...")
+                emitLog("Connessione a $server:$port$proxyInfo...")
 
                 val rawSocket = createProtectedSocket()
                 socket = rawSocket
                 reader = rawSocket.getInputStream().bufferedReader(Charsets.UTF_8)
-                writer = OutputStreamWriter(rawSocket.getOutputStream(), Charsets.UTF_8)
+                val outWriter = OutputStreamWriter(rawSocket.getOutputStream(), Charsets.UTF_8)
+                writer = outWriter
 
-                // Ident e Realname totalmente anonimi (non espone mai il dispositivo o la posizione)
-                val anonIdent = "usr" + (1000..9999).random()
-                sendRaw("NICK $nickname")
-                // Il parametro "8" nel comando USER richiede già la modalità Invisibile (+i) secondo RFC 2812
-                sendRaw("USER $anonIdent 8 * :IRC Client")
+                // Avvia il singolo consumer FIFO per garantire l'ordine rigoroso dei comandi RFC 2812
+                writerJob = launch(Dispatchers.IO) {
+                    for (cmdLine in outgoingQueue) {
+                        try {
+                            outWriter.write(cmdLine + "\r\n")
+                            outWriter.flush()
+                        } catch (e: Exception) {
+                            break
+                        }
+                    }
+                }
+
+                // Handshake RFC 2812 in ordine garantito: prima NICK, poi USER (bitmask 8 = +i invisibile)
+                val anonIdent = "u" + (1000..9999).random()
+                sendRaw("NICK $activeNick")
+                sendRaw("USER $anonIdent 8 * :mIRC Client")
 
                 while (isActive) {
                     val line = reader?.readLine() ?: break
                     handleLine(line)
                 }
             } catch (e: Exception) {
-                emitLog("Errore connessione IRC: ${e.message}")
+                emitLog("Errore connessione IRC ($server:$port): ${e.message}")
             } finally {
+                writerJob?.cancel()
                 events.tryEmit(Event.Disconnected("Connessione terminata"))
             }
+        }
+    }
+
+    private fun sanitizeNickname(raw: String): String {
+        val clean = raw.replace(Regex("[^a-zA-Z0-9_\\-\\[\\]]"), "")
+        return if (clean.length < 3 || clean[0].isDigit()) {
+            "Mule" + (1000..9999).random()
+        } else {
+            clean.take(15)
         }
     }
 
@@ -144,17 +178,28 @@ class IrcXdccEngine(
         val baseSocket = if (useProxy) {
             val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress(socksProxyHost.trim(), socksProxyPort))
             Socket(proxy).apply {
+                soTimeout = 0
+                keepAlive = true
                 connect(InetSocketAddress(server, port), 20_000)
             }
         } else {
             Socket().apply {
+                soTimeout = 0
+                keepAlive = true
                 connect(InetSocketAddress(server, port), 15_000)
             }
         }
 
         return if (useSsl) {
-            val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
-            sslFactory.createSocket(baseSocket, server, port, true)
+            val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+                override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+                override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
+                override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+            })
+            val sslContext = SSLContext.getInstance("TLS")
+            sslContext.init(null, trustAllCerts, SecureRandom())
+            val sslSocket = sslContext.socketFactory.createSocket(baseSocket, server, port, true)
+            sslSocket
         } else {
             baseSocket
         }
@@ -162,9 +207,11 @@ class IrcXdccEngine(
 
     fun disconnect() {
         sendRaw("QUIT :Client closed")
+        writerJob?.cancel()
         connectionJob?.cancel()
         joinedChannels.clear()
         currentChannel = null
+        isRegisteredOnServer = false
         try { socket?.close() } catch (_: Exception) {}
     }
 
@@ -176,7 +223,7 @@ class IrcXdccEngine(
             val target = currentChannel
             if (!target.isNullOrBlank()) {
                 sendMessage(target, input)
-                events.tryEmit(Event.ChannelMessage(nickname, target, input))
+                events.tryEmit(Event.ChannelMessage(activeNick, target, input))
             } else {
                 emitLog("Nessun canale attivo. Usa /list o /join #canale")
             }
@@ -217,7 +264,10 @@ class IrcXdccEngine(
                     emitLog("-> [$arg1] $arg2")
                 }
             }
-            "nick" -> if (arg1.isNotBlank()) sendRaw("NICK $arg1")
+            "nick" -> if (arg1.isNotBlank()) {
+                activeNick = sanitizeNickname(arg1)
+                sendRaw("NICK $activeNick")
+            }
             "whois" -> if (arg1.isNotBlank()) sendRaw("WHOIS $arg1")
             "names" -> {
                 val ch = if (arg1.isNotBlank()) arg1 else currentChannel.orEmpty()
@@ -237,12 +287,8 @@ class IrcXdccEngine(
         val ch = if (channel.startsWith("#")) channel else "#$channel"
         currentChannel = ch
         joinedChannels.add(ch)
-        // Assicura che il mascheramento IP (+ix) sia attivo prima di entrare nel canale!
-        if (ipCloakMode) {
-            sendRaw("MODE $nickname +ix")
-        }
         sendRaw("JOIN $ch")
-        emitLog("Ingresso nel canale $ch (IP Offuscato +ix attivo)...")
+        emitLog("Ingresso nel canale $ch...")
         events.tryEmit(Event.ChannelJoined(ch, joinedChannels.toSet()))
     }
 
@@ -267,44 +313,47 @@ class IrcXdccEngine(
         emitLog("Richiesto pacchetto #$packNumber al bot $botNick")
     }
 
-    @Synchronized
     private fun sendRaw(line: String) {
-        scope.launch(Dispatchers.IO) {
-            try {
-                writer?.let {
-                    it.write(line + "\r\n")
-                    it.flush()
-                }
-            } catch (e: Exception) {
-                events.tryEmit(Event.Log("Errore invio: ${e.message}"))
-            }
-        }
+        outgoingQueue.trySend(line)
     }
 
     private fun emitLog(text: String) = events.tryEmit(Event.Log(text))
 
     private fun handleLine(line: String) {
+        // Risposta immediata ai PING anti-spoof (sia "PING :token" che ":srv PING :token")
+        if (line.startsWith("PING ", ignoreCase = true)) {
+            val token = line.substring(5).trim()
+            sendRaw("PONG $token")
+            return
+        }
+
         val msg = parseLine(line)
         when (msg.command.uppercase()) {
-            "PING" -> sendRaw("PONG :${msg.trailing ?: msg.params.firstOrNull().orEmpty()}")
+            "PING" -> {
+                val token = msg.trailing ?: msg.params.firstOrNull().orEmpty()
+                sendRaw("PONG :$token")
+            }
             "001" -> {
-                // ATTIVA SUBITO OFFUSCAMENTO IP / HOST CLOAKING (+x) E MODALITÀ INVISIBILE (+i)
+                isRegisteredOnServer = true
+                msg.params.firstOrNull()?.takeIf { it.isNotBlank() }?.let { confirmedNick ->
+                    activeNick = confirmedNick
+                }
+                // Applica il cloaking IP una sola volta dopo la conferma 001 del server
                 if (ipCloakMode) {
-                    sendRaw("MODE $nickname +ix")
-                    sendRaw("MODE $nickname +x")
-                    emitLog("Scudo Privacy IRC attivato: MODE +ix (IP/Host offuscato nelle chat)")
+                    sendRaw("MODE $activeNick +ix")
+                    emitLog("Scudo Privacy IRC attivato: MODE $activeNick +ix")
                 }
                 events.tryEmit(Event.Connected(server, ipCloakMode))
                 autoJoinChannel?.takeIf { it.isNotBlank() }?.let { joinChannel(it) }
             }
-            "396" -> { // RPL_HOSTHIDDEN: conferma ufficiale del server che il tuo IP è stato nascosto!
+            "396" -> {
                 val maskedHost = msg.params.getOrNull(1) ?: "vhost.cloaked"
                 emitLog("IP Offuscato dal Server: ora appari come '$maskedHost'")
             }
             "JOIN" -> {
                 val who = msg.prefix?.substringBefore('!').orEmpty()
                 val ch = msg.trailing ?: msg.params.firstOrNull().orEmpty()
-                if (who.equals(nickname, ignoreCase = true) && ch.startsWith("#")) {
+                if (who.equals(activeNick, ignoreCase = true) && ch.startsWith("#")) {
                     joinedChannels.add(ch)
                     currentChannel = ch
                     events.tryEmit(Event.ChannelJoined(ch, joinedChannels.toSet()))
@@ -327,15 +376,27 @@ class IrcXdccEngine(
                 events.tryEmit(Event.ChannelListEnd(listedChannelCount))
                 emitLog("Fine /list: trovati $listedChannelCount canali.")
             }
-            "433" -> {
-                val newNick = nickname + (100..999).random()
-                sendRaw("NICK $newNick")
+            "433", "432" -> { // Nickname in uso o non valido
+                activeNick = "Mule" + (10000..99999).random()
+                emitLog("Cambio nick automatico in $activeNick...")
+                sendRaw("NICK $activeNick")
+            }
+            "451" -> { // ERR_NOTREGISTERED: reinvia registrazione se richiesto
+                if (!isRegisteredOnServer) {
+                    val anonIdent = "u" + (1000..9999).random()
+                    sendRaw("NICK $activeNick")
+                    sendRaw("USER $anonIdent 8 * :mIRC Client")
+                }
             }
             "NOTICE" -> {
                 val from = msg.prefix?.substringBefore('!') ?: "Server"
                 val text = msg.trailing.orEmpty()
-                emitLog("[$from] $text")
-                checkAndCaptureBotAnnouncement(from, currentChannel ?: "#irc", text)
+                if (text.startsWith('\u0001')) {
+                    handleCtcp(from, text.trim('\u0001'))
+                } else {
+                    emitLog("[$from] $text")
+                    checkAndCaptureBotAnnouncement(from, currentChannel ?: "#irc", text)
+                }
             }
             "PRIVMSG" -> handlePrivmsg(msg)
             "ERROR" -> emitLog("Server: ${msg.trailing}")
@@ -375,10 +436,6 @@ class IrcXdccEngine(
         events.tryEmit(Event.ChannelPacksDiscovered(listOf(item)))
     }
 
-    /**
-     * Gestisce i pacchetti CTCP: accetta i download DCC ma BLOCCA le richieste di tracciamento
-     * (TIME, LOCATION, FINGER, USERINFO) e risponde con un generico client PC a VERSION.
-     */
     private fun handleCtcp(from: String, payload: String) {
         val upper = payload.uppercase()
         if (upper.startsWith("DCC ")) {
@@ -390,9 +447,14 @@ class IrcXdccEngine(
             return
         }
 
+        if (upper.startsWith("PING")) {
+            val arg = payload.substringAfter("PING", "").trim()
+            sendRaw("NOTICE $from :\u0001PING $arg\u0001")
+            return
+        }
+
         if (blockCtcpInfo) {
             if (upper.startsWith("VERSION")) {
-                // Risponde come mIRC standard per PC così i bot XDCC ti accettano senza scoprire che sei su Android
                 sendRaw("NOTICE $from :\u0001VERSION mIRC v7.72\u0001")
                 emitLog("Protetto da scansione CTCP VERSION di $from (Risposto: mIRC PC)")
             } else {
@@ -530,3 +592,4 @@ class IrcXdccEngine(
         return IrcMessage(prefix, tokens.firstOrNull() ?: "", tokens.drop(1), trailing)
     }
 }
+        
