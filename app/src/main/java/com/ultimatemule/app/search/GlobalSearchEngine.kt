@@ -418,6 +418,9 @@ class GlobalSearchEngine(private val configDir: File) {
             FileCategory.SOFTWARE_DOC ->
                 "Contenuto File (.$ext):\n" +
                 "  • File diretto apribile dalla scheda 'File & VLC' tramite il pulsante 'APRI FILE'"
+            else ->
+                "Contenuto File (.$ext):\n" +
+                "  • Dettagli non disponibili"
         }
 
         val fakeCheck = if (sources >= 3) "VERIFICATO (Fonti multiple concordanti)" else "Poche fonti (Verifica consigliata)"
