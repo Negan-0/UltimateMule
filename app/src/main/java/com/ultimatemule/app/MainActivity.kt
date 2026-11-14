@@ -1,33 +1,20 @@
 package com.ultimatemule.app
 
-import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.app.Dialog
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
-import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.os.Environment
-import android.os.PowerManager
 import android.os.StrictMode
-import android.provider.Settings
 import android.view.Gravity
-import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.view.Window
-import android.webkit.MimeTypeMap
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -36,25 +23,27 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import com.ultimatemule.app.ed2k.Ed2kKadManager
+import com.ultimatemule.app.ed2k.Ed2kTransferState
 import com.ultimatemule.app.irc.IrcXdccEngine
 import com.ultimatemule.app.player.VlcPlayerManager
 import com.ultimatemule.app.search.GlobalSearchEngine
 import com.ultimatemule.app.service.P2PEngineService
 import com.ultimatemule.app.streaming.TorrentStreamEngine
 import com.ultimatemule.app.streaming.TorrentStreamState
+import com.ultimatemule.app.ui.OnboardingWizard
+import com.ultimatemule.app.ui.SettingsScreenBuilder
+import com.ultimatemule.app.ui.UiComponents
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import org.videolan.libvlc.util.VLCVideoLayout
 import java.io.File
 
 class MainActivity : Activity() {
 
     private val mainScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
-    // Le 6 Sezioni nell'ordine richiesto:
-    // 0: Reti | 1: Cerca | 2: Torrent | 3: mIRC | 4: File & VLC (accanto a Opzioni!) | 5: Opzioni
+    // Le 6 Sezioni: 0: Reti | 1: Cerca | 2: Torrent | 3: mIRC | 4: File & VLC | 5: Opzioni
     private lateinit var screenNetworks: LinearLayout
     private lateinit var screenSearch: LinearLayout
     private lateinit var screenTorrent: LinearLayout
@@ -64,23 +53,29 @@ class MainActivity : Activity() {
 
     private val navItems = mutableListOf<LinearLayout>()
 
-    // Riferimenti UI Reti
+    // Riferimenti UI Reti (eD2K / KAD)
     private lateinit var topStatusBanner: TextView
     private lateinit var btnGlobalConnectToggle: Button
     private lateinit var serverListLog: TextView
-    private var selectedEd2kConnectionMode = 0 // 0 = Server+KAD, 1 = Solo Server, 2 = Solo KAD
+    private var selectedEd2kConnectionMode = 0
 
     // Riferimenti UI Cerca
     private lateinit var btnDynamicSearch: Button
     private lateinit var searchResultsContainer: LinearLayout
 
-    // Riferimenti UI File & VLC e Torrent
+    // Riferimenti UI File & VLC (Mostra separatamente eD2K e Torrent)
+    private lateinit var activeEd2kBoxInFiles: LinearLayout
+    private lateinit var activeEd2kTitleInFiles: TextView
+    private lateinit var activeEd2kProgressInFiles: ProgressBar
+    private lateinit var activeEd2kPreviewHolder: LinearLayout
+
     private lateinit var activeDownloadBoxInFiles: LinearLayout
     private lateinit var activeDownloadTitleInFiles: TextView
     private lateinit var activeDownloadProgressInFiles: ProgressBar
     private lateinit var activeDownloadPreviewHolderInFiles: LinearLayout
     private lateinit var filesListContainer: LinearLayout
 
+    // Riferimenti UI Torrent
     private lateinit var torrentStatusText: TextView
     private lateinit var torrentProgressBar: ProgressBar
 
@@ -97,20 +92,25 @@ class MainActivity : Activity() {
     private val scannedChannels = mutableListOf<IrcXdccEngine.IrcChannelInfo>()
     private val discoveredChannelPacks = linkedMapOf<String, IrcXdccEngine.ChannelPackItem>()
 
-    // Motori P2P & Media
+    // I 3 Motori P2P Separati + Media Player + Wizard
+    private lateinit var ed2kManager: Ed2kKadManager
+    private lateinit var torrentEngine: TorrentStreamEngine
     private var ircEngine: IrcXdccEngine? = null
     private lateinit var vlcManager: VlcPlayerManager
-    private lateinit var torrentEngine: TorrentStreamEngine
     private lateinit var searchEngine: GlobalSearchEngine
+    private lateinit var onboardingWizard: OnboardingWizard
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
 
-        vlcManager = VlcPlayerManager(this)
+        val configDir = File(UiComponents.getBaseMulePath(this), "Config")
+        ed2kManager = Ed2kKadManager(configDir)
         torrentEngine = TorrentStreamEngine(this)
-        searchEngine = GlobalSearchEngine(File(getBaseMulePath(), "Config"))
+        vlcManager = VlcPlayerManager(this)
+        searchEngine = GlobalSearchEngine(configDir)
+        onboardingWizard = OnboardingWizard(this)
 
         val rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -133,7 +133,7 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        val btnQuickDisconnect = compactRowButton("SCOLLEGA RETI", "#991B1B", 0f) {
+        val btnQuickDisconnect = UiComponents.compactRowButton(this, "SCOLLEGA RETI", "#991B1B", 0f) {
             disconnectAllNetworks()
         }
 
@@ -157,7 +157,7 @@ class MainActivity : Activity() {
         screenTorrent = buildTorrentScreen()
         screenIrc = buildIrcScreen()
         screenFilesVlc = buildFilesVlcScreen()
-        screenSettings = buildSettingsScreen()
+        screenSettings = SettingsScreenBuilder.build(this)
 
         contentHolder.addView(screenNetworks)
         contentHolder.addView(screenSearch)
@@ -169,7 +169,7 @@ class MainActivity : Activity() {
         contentScroll.addView(contentHolder)
         rootLayout.addView(contentScroll)
 
-        // --- BARRA INFERIORE CON "FILE & VLC" VICINO A "OPZIONI" ---
+        // --- BARRA DI NAVIGAZIONE INFERIORE ---
         val bottomNav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.parseColor("#181C24"))
@@ -179,120 +179,34 @@ class MainActivity : Activity() {
             )
         }
 
-        bottomNav.addView(createBottomNavItem(R.drawable.ic_networks, "Reti", 0))
-        bottomNav.addView(createBottomNavItem(R.drawable.ic_search, "Cerca", 1))
-        bottomNav.addView(createBottomNavItem(R.drawable.ic_torrent, "Torrent", 2))
-        bottomNav.addView(createBottomNavItem(R.drawable.ic_irc, "mIRC", 3))
-        bottomNav.addView(createBottomNavItem(R.drawable.ic_transfers, "File & VLC", 4))
-        bottomNav.addView(createBottomNavItem(R.drawable.ic_settings, "Opzioni", 5))
+        val tabs = listOf(
+            R.drawable.ic_networks to "Reti",
+            R.drawable.ic_search to "Cerca",
+            R.drawable.ic_torrent to "Torrent",
+            R.drawable.ic_irc to "mIRC",
+            R.drawable.ic_transfers to "File & VLC",
+            R.drawable.ic_settings to "Opzioni"
+        )
+        tabs.forEachIndexed { idx, pair ->
+            val navItem = UiComponents.createBottomNavItem(this, pair.first, pair.second, idx) {
+                selectScreen(it)
+            }
+            navItems.add(navItem)
+            bottomNav.addView(navItem)
+        }
 
         rootLayout.addView(bottomNav)
         setContentView(rootLayout)
 
+        observeEd2kEngineState()
         observeTorrentEngineState()
         P2PEngineService.updateNotificationStatus(this, "Servizio P2P pronto")
         selectScreen(0)
-
-        // WIZARD AUTOMATICO DI PRIMO AVVIO (1: Memoria -> 2: Cartella -> 3: Batteria -> 4: Notifiche)
-        runSequentialOnboardingWizard()
     }
 
     override fun onResume() {
         super.onResume()
-        runSequentialOnboardingWizard()
-    }
-
-    /**
-     * All'installazione chiede in ordine automatico:
-     * 1) Sblocco Memoria Totale
-     * 2) Dove creare le cartelle Incoming / Temp / Config
-     * 3) Disattivazione blocco Batteria
-     * 4) Permesso Notifiche
-     */
-    private fun runSequentialOnboardingWizard() {
-        val prefs = getSharedPreferences("UltimateMulePrefs", Context.MODE_PRIVATE)
-
-        // Passo 1: Accesso a tutti i file
-        if (!Environment.isExternalStorageManager()) {
-            if (!prefs.getBoolean("wizard_asking_storage", false)) {
-                prefs.edit().putBoolean("wizard_asking_storage", true).apply()
-                AlertDialog.Builder(this)
-                    .setTitle("Passo 1 di 3: Sblocco Memoria")
-                    .setMessage("Benvenuto in UltimateMule.\nConcedi l'accesso ai file per salvare liberamente nella memoria del telefono.")
-                    .setCancelable(false)
-                    .setPositiveButton("SBLOCCA ORA") { _, _ ->
-                        prefs.edit().putBoolean("wizard_asking_storage", false).apply()
-                        requestAllFilesAccess()
-                    }
-                    .show()
-            }
-            return
-        }
-
-        // Passo 2: Scelta cartella dove creare i file
-        if (!prefs.getBoolean("wizard_folder_configured", false)) {
-            val defaultPath = File(Environment.getExternalStorageDirectory(), "UltimateMule").absolutePath
-            val input = styledEditText(prefs.getString("custom_download_path", defaultPath) ?: defaultPath)
-            AlertDialog.Builder(this)
-                .setTitle("Passo 2 di 3: Cartella di Salvataggio")
-                .setMessage("Scegli o conferma la cartella dove verranno creati Incoming, Temp e Config:")
-                .setView(input)
-                .setCancelable(false)
-                .setPositiveButton("CONFERMA E CREA") { _, _ ->
-                    val chosen = input.text.toString().trim().ifEmpty { defaultPath }
-                    prefs.edit()
-                        .putString("custom_download_path", chosen)
-                        .putBoolean("wizard_folder_configured", true)
-                        .apply()
-                    verifyAndCreateFolders(chosen)
-                    runSequentialOnboardingWizard()
-                }
-                .show()
-            return
-        }
-
-        // Passo 3: Sblocco Batteria
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        if (!pm.isIgnoringBatteryOptimizations(packageName) && !prefs.getBoolean("wizard_battery_done", false)) {
-            prefs.edit().putBoolean("wizard_battery_done", true).apply()
-            disableBatteryOptimization()
-            return
-        }
-
-        // Passo 4: Notifiche (Richiesta nativa Android)
-        if (Build.VERSION.SDK_INT >= 33) {
-            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
-            }
-        }
-    }
-
-    private fun createBottomNavItem(iconRes: Int, label: String, index: Int): LinearLayout {
-        val item = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(4, 14, 4, 14)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { selectScreen(index) }
-        }
-
-        val icon = ImageView(this).apply {
-            setImageResource(iconRes)
-            layoutParams = LinearLayout.LayoutParams(44, 44)
-        }
-
-        val text = TextView(this).apply {
-            this.text = label
-            textSize = 10f
-            setTextColor(Color.parseColor("#9CA3AF"))
-            gravity = Gravity.CENTER
-            setPadding(0, 4, 0, 0)
-        }
-
-        item.addView(icon)
-        item.addView(text)
-        navItems.add(item)
-        return item
+        onboardingWizard.checkAndRunNextStep()
     }
 
     private fun selectScreen(index: Int) {
@@ -340,7 +254,7 @@ class MainActivity : Activity() {
     }
 
     // =========================================================================
-    // 1. SCHERMATA RETI: SCELTA SERVER+KAD / SOLO SERVER / SOLO KAD + AGGIUNTA SERVER/NODES
+    // 1. SCHERMATA RETI (MOTORE EMULE: ED2K + KAD)
     // =========================================================================
     private fun buildNetworksScreen(): LinearLayout {
         val prefs = getSharedPreferences("UltimateMulePrefs", Context.MODE_PRIVATE)
@@ -356,8 +270,8 @@ class MainActivity : Activity() {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
 
-            addView(sectionTitle("Modalità di Connessione eD2K / KAD"))
-            addView(infoLabel("Scegli se collegarti e scaricare usando Entrambi, Solo Server eD2K o Solo Rete KAD:"))
+            addView(UiComponents.sectionTitle(this@MainActivity, "Modalità di Connessione eMule (eD2K / KAD)"))
+            addView(UiComponents.infoLabel(this@MainActivity, "Scegli se collegarti e scaricare usando Entrambi, Solo Server eD2K o Solo Rete KAD:"))
 
             val modeSpinner = Spinner(this@MainActivity).apply {
                 val modes = listOf(
@@ -377,10 +291,10 @@ class MainActivity : Activity() {
             }
             addView(modeSpinner)
 
-            val kadUrlsInput = styledEditText(savedKadUrls).apply { minLines = 2 }
-            val serverUrlsInput = styledEditText(savedServerUrls).apply { minLines = 3 }
+            val kadUrlsInput = UiComponents.styledEditText(this@MainActivity, savedKadUrls).apply { minLines = 2 }
+            val serverUrlsInput = UiComponents.styledEditText(this@MainActivity, savedServerUrls).apply { minLines = 3 }
 
-            btnGlobalConnectToggle = compactButton("CONNETTI (SERVER + KAD)", "#16A34A") {
+            btnGlobalConnectToggle = UiComponents.compactButton(this@MainActivity, "CONNETTI (SERVER + KAD)", "#16A34A") {
                 if (Ed2kKadManager.isConnected) {
                     Ed2kKadManager.disconnectAll()
                     updateConnectButtonLabel()
@@ -397,7 +311,7 @@ class MainActivity : Activity() {
                     btnGlobalConnectToggle.text = "CONNESSIONE IN CORSO..."
                     btnGlobalConnectToggle.setBackgroundColor(Color.parseColor("#D97706"))
 
-                    val configDir = File(getBaseMulePath(), "Config")
+                    val configDir = File(UiComponents.getBaseMulePath(this@MainActivity), "Config")
                     val manager = Ed2kKadManager(configDir)
                     mainScope.launch {
                         var serversCount = 0
@@ -411,7 +325,7 @@ class MainActivity : Activity() {
                             serversCount = servers.size
                             totalUsers = servers.sumOf { it.users }
                             servers.take(12).forEach { s ->
-                                appendServerLog("• ${s.name} [${s.ip}:${s.port}] - Utenti: ${s.users}")
+                                appendServerLog("- ${s.name} [${s.ip}:${s.port}] - Utenti: ${s.users}")
                             }
                         }
 
@@ -447,32 +361,32 @@ class MainActivity : Activity() {
             }
             addView(serverListLog)
 
-            // AGGIUNTA MANUALE SINGOLO SERVER (IP:PORTA)
-            addView(sectionTitle("Aggiungi Nuovo Server eD2K Manuale (IP:Porta)"))
+            addView(UiComponents.sectionTitle(this@MainActivity, "Aggiungi Nuovo Server eD2K Manuale (IP:Porta)"))
             val addSrvRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
             }
-            val customSrvIpPort = styledEditText("").apply {
+            val customSrvIpPort = UiComponents.styledEditText(this@MainActivity, "").apply {
                 hint = "IP:Porta (es. 176.125.242.230:5555)"
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.3f).apply {
                     setMargins(0, 4, 6, 4)
                 }
             }
-            val customSrvName = styledEditText("").apply {
+            val customSrvName = UiComponents.styledEditText(this@MainActivity, "").apply {
                 hint = "Nome Server"
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                     setMargins(0, 4, 6, 4)
                 }
             }
-            val btnAddSrv = compactRowButton("+ SERVER", "#0284C7", 0f) {
+            val btnAddSrv = UiComponents.compactRowButton(this@MainActivity, "+ SERVER", "#0284C7", 0f) {
                 val raw = customSrvIpPort.text.toString().trim()
                 val name = customSrvName.text.toString().trim().ifEmpty { "Server Personalizzato" }
                 val parts = raw.split(":")
                 val ip = parts.getOrNull(0).orEmpty()
                 val port = parts.getOrNull(1)?.toIntOrNull() ?: 4661
                 if (ip.count { it == '.' } == 3) {
-                    Ed2kKadManager.activeServers["$ip:$port"] = Ed2kKadManager.Ed2kServer(ip, port, name, "Aggiunto dall'utente", 50000, 1000000)
+                    Ed2kKadManager.activeServers["$ip:$port"] =
+                        Ed2kKadManager.Ed2kServer(ip, port, name, "Aggiunto dall'utente", 50000, 1000000)
                     appendServerLog("Aggiunto server manuale: $name [$ip:$port]")
                     customSrvIpPort.setText("")
                     customSrvName.setText("")
@@ -486,10 +400,10 @@ class MainActivity : Activity() {
             addSrvRow.addView(btnAddSrv)
             addView(addSrvRow)
 
-            addView(sectionTitle("Liste URL server.met & nodes.dat (Puoi aggiungerne altri, uno per riga)"))
-            addView(infoLabel("URL nodes.dat (Nodi KAD):"))
+            addView(UiComponents.sectionTitle(this@MainActivity, "Liste URL server.met & nodes.dat (Uno per riga)"))
+            addView(UiComponents.infoLabel(this@MainActivity, "URL nodes.dat (Nodi KAD):"))
             addView(kadUrlsInput)
-            addView(infoLabel("URL server.met (Liste Server eD2K):"))
+            addView(UiComponents.infoLabel(this@MainActivity, "URL server.met (Liste Server eD2K):"))
             addView(serverUrlsInput)
         }
     }
@@ -510,18 +424,17 @@ class MainActivity : Activity() {
     }
 
     // =========================================================================
-    // 2. SCHERMATA CERCA: COLLEGATA A ED2K/KAD, TORRENT (CORSARO NERO/1337X) E CANALI IRC!
-    //    NON CAMBIA PIÙ SCHERMATA DA SOLA QUANDO PREMI SCARICA!
+    // 2. SCHERMATA CERCA GLOBALE (SMISTA I RISULTATI AI 3 MOTORI SEPARATI)
     // =========================================================================
     private fun buildSearchScreen(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
 
-            addView(sectionTitle("Ricerca Multi-Rete (eD2K/KAD, IlCorsaroNero, 1337x, XDCC.eu & Canali IRC)"))
-            addView(infoLabel("Cerca file su tutte le reti o solo su una specifica. Quando avvii un download resti in questa schermata:"))
+            addView(UiComponents.sectionTitle(this@MainActivity, "Ricerca Globale (eMule eD2K/KAD, Siti Torrent & mIRC XDCC)"))
+            addView(UiComponents.infoLabel(this@MainActivity, "I 3 motori lavorano separatamente. Cliccando SCARICA si avvia il motore specifico della rete:"))
 
-            val searchInput = styledEditText("").apply {
-                hint = "Es. titolo film ita, serie tv, mp3, archivio..."
+            val searchInput = UiComponents.styledEditText(this@MainActivity, "").apply {
+                hint = "Es. the Boys s01 e 3 ita, film 1080p ita, mp3..."
             }
             addView(searchInput)
 
@@ -530,7 +443,12 @@ class MainActivity : Activity() {
             }
 
             val netSpinner = Spinner(this@MainActivity).apply {
-                val nets = listOf("Tutte le Reti (Globale)", "Solo eD2K / KAD", "Solo BitTorrent (Corsaro/1337x)", "Solo IRC XDCC (Canali + Bot)")
+                val nets = listOf(
+                    "Tutte le Reti (Globale)",
+                    "Solo eMule (eD2K / KAD)",
+                    "Solo BitTorrent (Siti + DHT)",
+                    "Solo mIRC XDCC (Canali + Bot)"
+                )
                 adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, nets)
                 setBackgroundColor(Color.parseColor("#262B36"))
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
@@ -539,7 +457,13 @@ class MainActivity : Activity() {
             }
 
             val catSpinner = Spinner(this@MainActivity).apply {
-                val cats = listOf("Tutti i Formati", "Video (MKV/MP4/AVI)", "Audio (MP3/FLAC)", "Archivi (RAR/ZIP/ISO)", "Programmi/Doc (APK/PDF)")
+                val cats = listOf(
+                    "Tutti i Formati",
+                    "Video (MKV/MP4/AVI)",
+                    "Audio (MP3/FLAC)",
+                    "Archivi (RAR/ZIP/ISO)",
+                    "Programmi/Doc (APK/PDF)"
+                )
                 adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, cats)
                 setBackgroundColor(Color.parseColor("#262B36"))
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
@@ -551,7 +475,7 @@ class MainActivity : Activity() {
             spinnersRow.addView(catSpinner)
             addView(spinnersRow)
 
-            btnDynamicSearch = compactButton("RICERCA GLOBALE", "#0284C7") {
+            btnDynamicSearch = UiComponents.compactButton(this@MainActivity, "RICERCA GLOBALE", "#0284C7") {
                 val query = searchInput.text.toString().trim()
                 if (query.isEmpty()) {
                     Toast.makeText(this@MainActivity, "Scrivi cosa vuoi cercare", Toast.LENGTH_SHORT).show()
@@ -577,9 +501,9 @@ class MainActivity : Activity() {
             netSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                     btnDynamicSearch.text = when (position) {
-                        1 -> "CERCA SU ED2K / KAD"
+                        1 -> "CERCA SU EMULE (ED2K / KAD)"
                         2 -> "CERCA SU BITTORRENT"
-                        3 -> "CERCA SU IRC XDCC"
+                        3 -> "CERCA SU MIRC XDCC"
                         else -> "RICERCA GLOBALE"
                     }
                 }
@@ -600,23 +524,41 @@ class MainActivity : Activity() {
         catFilter: GlobalSearchEngine.FileCategory
     ) {
         searchResultsContainer.removeAllViews()
-        searchResultsContainer.addView(infoLabel("Ricerca in corso per \"$query\"..."))
+        searchResultsContainer.addView(UiComponents.infoLabel(this, "Ricerca in corso per \"$query\"..."))
 
-        // Invia anche @find ai canali IRC attivi
         if (netFilter == GlobalSearchEngine.NetworkType.ALL || netFilter == GlobalSearchEngine.NetworkType.IRC_XDCC) {
             ircEngine?.sendSearchCommandToActiveChannels(query)
         }
 
+        val prefs = getSharedPreferences("UltimateMulePrefs", Context.MODE_PRIVATE)
+        val langPref = when (prefs.getInt("search_lang_pref", 0)) {
+            1 -> GlobalSearchEngine.LanguagePreference.ITALIAN_PRIORITY
+            2 -> GlobalSearchEngine.LanguagePreference.ITALIAN_STRICT
+            3 -> GlobalSearchEngine.LanguagePreference.ENGLISH
+            else -> GlobalSearchEngine.LanguagePreference.ANY
+        }
+        val customSitesRaw = prefs.getString(
+            "custom_torrent_sites",
+            GlobalSearchEngine.DEFAULT_CUSTOM_TORRENT_SITES
+        ) ?: GlobalSearchEngine.DEFAULT_CUSTOM_TORRENT_SITES
+        val customSiteTemplates = customSitesRaw.split("\n").map { it.trim() }.filter { it.isNotEmpty() }
+
         mainScope.launch {
-            val results = searchEngine.search(query, netFilter, catFilter)
+            val results = searchEngine.search(
+                query = query,
+                netFilter = netFilter,
+                catFilter = catFilter,
+                langPref = langPref,
+                customTorrentSiteTemplates = customSiteTemplates
+            )
             searchResultsContainer.removeAllViews()
 
             if (results.isEmpty()) {
-                searchResultsContainer.addView(infoLabel("Nessun file trovato per \"$query\"."))
+                searchResultsContainer.addView(UiComponents.infoLabel(this@MainActivity, "Nessun file trovato per \"$query\"."))
                 return@launch
             }
 
-            searchResultsContainer.addView(infoLabel("Trovati ${results.size} file disponibili:"))
+            searchResultsContainer.addView(UiComponents.infoLabel(this@MainActivity, "Trovati ${results.size} file disponibili:"))
 
             results.forEach { res ->
                 val card = LinearLayout(this@MainActivity).apply {
@@ -631,15 +573,22 @@ class MainActivity : Activity() {
                     layoutParams = lp
                 }
 
+                val netTag = when (res.network) {
+                    GlobalSearchEngine.NetworkType.ED2K_KAD -> "eMule"
+                    GlobalSearchEngine.NetworkType.TORRENT -> "Torrent"
+                    GlobalSearchEngine.NetworkType.IRC_XDCC -> "mIRC"
+                    else -> "P2P"
+                }
+
                 val titleView = TextView(this@MainActivity).apply {
-                    text = "[${res.fileExtension}]  ${res.title}"
+                    text = "[$netTag | ${res.fileExtension}]  ${res.title}"
                     textSize = 13f
                     setTextColor(Color.WHITE)
                     setTypeface(null, Typeface.BOLD)
                 }
 
                 val detailsView = TextView(this@MainActivity).apply {
-                    text = "Dim: ${res.sizeText}  |  Fonti: ${res.sources}  |  Origine: ${res.providerName}"
+                    text = "Dim: ${res.sizeText}  |  Fonti: ${res.sources}  |  Rete: ${res.providerName}"
                     textSize = 11f
                     setTextColor(Color.parseColor("#38BDF8"))
                     setPadding(0, 6, 0, 10)
@@ -649,17 +598,19 @@ class MainActivity : Activity() {
                     orientation = LinearLayout.HORIZONTAL
                 }
 
-                btnRow.addView(compactRowButton("ISPEZIONA", "#374151", 1f) {
+                btnRow.addView(UiComponents.compactRowButton(this@MainActivity, "ISPEZIONA", "#374151", 1f) {
                     AlertDialog.Builder(this@MainActivity)
                         .setTitle("Ispezione [${res.fileExtension}]")
                         .setMessage(res.inspectionSummary)
-                        .setPositiveButton("SCARICA") { _, _ -> startDownloadStayOnScreen(res) }
+                        .setPositiveButton("SCARICA CON ${netTag.uppercase()}") { _, _ ->
+                            dispatchDownloadToDedicatedEngine(res)
+                        }
                         .setNegativeButton("Chiudi", null)
                         .show()
                 })
 
-                btnRow.addView(compactRowButton("SCARICA", "#16A34A", 1f) {
-                    startDownloadStayOnScreen(res)
+                btnRow.addView(UiComponents.compactRowButton(this@MainActivity, "SCARICA ($netTag)", "#16A34A", 1f) {
+                    dispatchDownloadToDedicatedEngine(res)
                 })
 
                 card.addView(titleView)
@@ -671,27 +622,48 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Avvia il download SENZA cambiare schermata! L'utente resta su Cerca e decide lui quando andare su File & VLC.
+     * Smista rigorosamente il download al motore dedicato corrispondente:
+     * - ED2K_KAD -> Motore nativo Ed2kKadManager
+     * - TORRENT  -> Motore nativo TorrentStreamEngine
+     * - IRC_XDCC -> Motore nativo IrcXdccEngine
      */
-    private fun startDownloadStayOnScreen(res: GlobalSearchEngine.SearchResult) {
+    private fun dispatchDownloadToDedicatedEngine(res: GlobalSearchEngine.SearchResult) {
+        val baseDir = File(UiComponents.getBaseMulePath(this))
+        val tempDir = File(baseDir, "Temp").apply { mkdirs() }
+        val incomingDir = File(baseDir, "Incoming").apply { mkdirs() }
+
         when (res.network) {
-            GlobalSearchEngine.NetworkType.IRC_XDCC -> {
-                startIrcAutomatedDownloadInBackground(res.ircServer, res.ircChannel, res.ircBot, res.ircPack)
+            GlobalSearchEngine.NetworkType.ED2K_KAD -> {
+                activeEd2kBoxInFiles.visibility = View.VISIBLE
+                ed2kManager.startEd2kDownload(
+                    ed2kLink = res.actionPayload,
+                    tempDir = tempDir,
+                    incomingDir = incomingDir
+                )
                 Toast.makeText(
                     this,
-                    "Richiesto pacchetto #${res.ircPack} a ${res.ircBot}. Vai su mIRC o File & VLC per seguirlo.",
+                    "Avviato nel motore eMule (eD2K/KAD): ${res.title}",
                     Toast.LENGTH_LONG
                 ).show()
             }
-            else -> {
+            GlobalSearchEngine.NetworkType.TORRENT -> {
                 activeDownloadBoxInFiles.visibility = View.VISIBLE
                 torrentEngine.startStream(res.actionPayload)
                 Toast.makeText(
                     this,
-                    "Download avviato: ${res.title}. Apri 'File & VLC' quando vuoi vedere l'avanzamento.",
+                    "Avviato nel motore BitTorrent: ${res.title}",
                     Toast.LENGTH_LONG
                 ).show()
             }
+            GlobalSearchEngine.NetworkType.IRC_XDCC -> {
+                startIrcAutomatedDownloadInBackground(res.ircServer, res.ircChannel, res.ircBot, res.ircPack)
+                Toast.makeText(
+                    this,
+                    "Avviato nel motore mIRC XDCC: Pacchetto #${res.ircPack} da ${res.ircBot}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            else -> {}
         }
     }
 
@@ -702,26 +674,26 @@ class MainActivity : Activity() {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
 
-            addView(sectionTitle("Aggiungi Link Magnet / URL .torrent / Hash"))
-            val directInput = styledEditText("").apply {
+            addView(UiComponents.sectionTitle(this@MainActivity, "Aggiungi Link Magnet / URL .torrent / InfoHash"))
+            val directInput = UiComponents.styledEditText(this@MainActivity, "").apply {
                 hint = "magnet:?xt=urn:btih:... oppure URL .torrent"
                 minLines = 2
             }
             addView(directInput)
 
-            addView(compactButton("AVVIA SCARICAMENTO TORRENT", "#0284C7") {
+            addView(UiComponents.compactButton(this@MainActivity, "AVVIA SCARICAMENTO TORRENT", "#0284C7") {
                 val input = directInput.text.toString().trim()
                 if (input.isNotEmpty()) {
                     activeDownloadBoxInFiles.visibility = View.VISIBLE
                     torrentEngine.startStream(input)
-                    Toast.makeText(this@MainActivity, "Scaricamento avviato!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Scaricamento BitTorrent avviato!", Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(this@MainActivity, "Inserisci un link Magnet o Torrent", Toast.LENGTH_SHORT).show()
                 }
             })
 
-            addView(sectionTitle("Stato Motore BitTorrent"))
-            torrentStatusText = infoLabel("Stato: Inattivo")
+            addView(UiComponents.sectionTitle(this@MainActivity, "Stato Motore BitTorrent"))
+            torrentStatusText = UiComponents.infoLabel(this@MainActivity, "Stato: Inattivo")
             torrentProgressBar = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
                 max = 100
                 progress = 0
@@ -732,10 +704,10 @@ class MainActivity : Activity() {
             val ctrlRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
             }
-            ctrlRow.addView(compactRowButton("FERMA (MANTIENI)", "#374151", 1f) {
+            ctrlRow.addView(UiComponents.compactRowButton(this@MainActivity, "FERMA (MANTIENI)", "#374151", 1f) {
                 torrentEngine.stopKeepFiles()
             })
-            ctrlRow.addView(compactRowButton("ELIMINA CACHE", "#991B1B", 1f) {
+            ctrlRow.addView(UiComponents.compactRowButton(this@MainActivity, "ELIMINA CACHE", "#991B1B", 1f) {
                 torrentEngine.stopAndClearCache()
             })
             addView(ctrlRow)
@@ -743,15 +715,14 @@ class MainActivity : Activity() {
     }
 
     // =========================================================================
-    // 4. SCHERMATA mIRC (SENZA BARRA DI RICERCA, CON SCUDO IP +ix E SERVER FUNZIONANTI)
+    // 4. SCHERMATA mIRC
     // =========================================================================
     private fun buildIrcScreen(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
 
-            addView(sectionTitle("Client mIRC Protetto (IP Cloaking +ix & Anti-Leak CTCP Attivi)"))
+            addView(UiComponents.sectionTitle(this@MainActivity, "Client mIRC Protetto (IP Cloaking +ix & Anti-Leak CTCP)"))
 
-            // Server IRC verificati e funzionanti per XDCC
             val verifiedServers = listOf(
                 "Scegli Server IRC verificato...",
                 "irc.rizon.net",
@@ -776,7 +747,7 @@ class MainActivity : Activity() {
             }
             addView(serverSpinner)
 
-            ircServerInput = styledEditText("irc.rizon.net").apply {
+            ircServerInput = UiComponents.styledEditText(this@MainActivity, "irc.rizon.net").apply {
                 hint = "Indirizzo Server IRC"
             }
             addView(ircServerInput)
@@ -785,7 +756,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
             }
 
-            btnIrcConnectToggle = compactRowButton("CONNETTI", "#16A34A", 1f) {
+            btnIrcConnectToggle = UiComponents.compactRowButton(this@MainActivity, "CONNETTI", "#16A34A", 1f) {
                 if (isIrcConnectedState || ircEngine != null) {
                     disconnectIrcCleanly()
                 } else {
@@ -794,7 +765,7 @@ class MainActivity : Activity() {
             }
 
             connRow.addView(btnIrcConnectToggle)
-            connRow.addView(compactRowButton("SCANSIONA (/LIST)", "#2563EB", 1.1f) {
+            connRow.addView(UiComponents.compactRowButton(this@MainActivity, "SCANSIONA (/LIST)", "#2563EB", 1.1f) {
                 if (ircEngine == null) {
                     Toast.makeText(this@MainActivity, "Premi prima CONNETTI", Toast.LENGTH_SHORT).show()
                 } else {
@@ -802,7 +773,7 @@ class MainActivity : Activity() {
                     ircEngine?.requestChannelList()
                 }
             })
-            connRow.addView(compactRowButton("CANALI", "#0284C7", 0.9f) {
+            connRow.addView(UiComponents.compactRowButton(this@MainActivity, "CANALI", "#0284C7", 0.9f) {
                 showScannedChannelsDialog()
             })
             addView(connRow)
@@ -818,7 +789,7 @@ class MainActivity : Activity() {
             addView(ircActiveChannelsBanner)
 
             ircLogText = TextView(this@MainActivity).apply {
-                text = "Console mIRC pronta. Lo scudo IP (+ix) viene attivato automaticamente alla connessione."
+                text = "Console mIRC pronta. Lo scudo IP (+ix) viene attivato dopo la registrazione sul server."
                 textSize = 11f
                 typeface = Typeface.MONOSPACE
                 setBackgroundColor(Color.parseColor("#0B0E14"))
@@ -828,7 +799,7 @@ class MainActivity : Activity() {
             }
             addView(ircLogText)
 
-            addView(sectionTitle("Barra Comandi mIRC"))
+            addView(UiComponents.sectionTitle(this@MainActivity, "Barra Comandi mIRC"))
             val cmdRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -846,7 +817,7 @@ class MainActivity : Activity() {
                 }
             }
 
-            val btnSendCmd = compactRowButton("INVIA", "#16A34A", 0f) {
+            val btnSendCmd = UiComponents.compactRowButton(this@MainActivity, "INVIA", "#16A34A", 0f) {
                 val cmd = ircCommandInput.text.toString().trim()
                 if (cmd.isNotEmpty()) {
                     if (cmd.equals("/list", ignoreCase = true)) scannedChannels.clear()
@@ -862,22 +833,22 @@ class MainActivity : Activity() {
             val quickCmdsRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
             }
-            quickCmdsRow.addView(compactRowButton("/list", "#374151", 1f) {
+            quickCmdsRow.addView(UiComponents.compactRowButton(this@MainActivity, "/list", "#374151", 1f) {
                 scannedChannels.clear()
                 ircEngine?.executeMircCommand("/list")
             })
-            quickCmdsRow.addView(compactRowButton("!list", "#374151", 1f) {
+            quickCmdsRow.addView(UiComponents.compactRowButton(this@MainActivity, "!list", "#374151", 1f) {
                 ircEngine?.executeMircCommand("!list")
             })
-            quickCmdsRow.addView(compactRowButton("/names", "#374151", 1f) {
+            quickCmdsRow.addView(UiComponents.compactRowButton(this@MainActivity, "/names", "#374151", 1f) {
                 ircEngine?.executeMircCommand("/names")
             })
-            quickCmdsRow.addView(compactRowButton("/part", "#374151", 1f) {
+            quickCmdsRow.addView(UiComponents.compactRowButton(this@MainActivity, "/part", "#374151", 1f) {
                 ircEngine?.executeMircCommand("/part")
             })
             addView(quickCmdsRow)
 
-            ircProgressLabel = infoLabel("Nessun download XDCC in corso")
+            ircProgressLabel = UiComponents.infoLabel(this@MainActivity, "Nessun download XDCC in corso")
             ircProgressBar = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
                 max = 100
                 progress = 0
@@ -885,7 +856,7 @@ class MainActivity : Activity() {
             addView(ircProgressLabel)
             addView(ircProgressBar)
 
-            addView(sectionTitle("File Presenti nel Canale (Cercabili anche dalla scheda 'Cerca')"))
+            addView(UiComponents.sectionTitle(this@MainActivity, "File Presenti nel Canale"))
             ircChannelFilesContainer = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(0, 8, 0, 0)
@@ -916,7 +887,7 @@ class MainActivity : Activity() {
 
     private fun connectToIrcServer(server: String, channel: String, onConnectedAction: (() -> Unit)? = null) {
         val prefs = getSharedPreferences("UltimateMulePrefs", Context.MODE_PRIVATE)
-        val base = File(getBaseMulePath())
+        val base = File(UiComponents.getBaseMulePath(this))
         val incomingDir = File(base, "Incoming").apply { mkdirs() }
         val tempDir = File(base, "Temp").apply { mkdirs() }
 
@@ -961,7 +932,7 @@ class MainActivity : Activity() {
                     }
                     is IrcXdccEngine.Event.ChannelJoined -> {
                         ircActiveChannelsBanner.text = "Canale: ${event.channel} (IP Protetto +ix)"
-                        appendIrcLog("Entrato in ${event.channel}. Ricezione elenco pacchetti del canale...")
+                        appendIrcLog("Entrato in ${event.channel}. In ascolto annunci pacchetti...")
                     }
                     is IrcXdccEngine.Event.ChannelMessage ->
                         appendIrcLog("[${event.target}] <${event.from}> ${event.text}")
@@ -1041,7 +1012,9 @@ class MainActivity : Activity() {
         val packs = discoveredChannelPacks.values.toList()
 
         if (packs.isEmpty()) {
-            ircChannelFilesContainer.addView(infoLabel("In attesa di annunci dai Bot del canale... (Puoi cercare qualsiasi file nella scheda 'Cerca'!)"))
+            ircChannelFilesContainer.addView(
+                UiComponents.infoLabel(this, "In attesa di annunci dai Bot del canale...")
+            )
             return
         }
 
@@ -1072,7 +1045,7 @@ class MainActivity : Activity() {
                 setPadding(0, 4, 0, 8)
             })
 
-            card.addView(compactButton("SCARICA (${pack.botNick} #${pack.packNumber})", "#16A34A") {
+            card.addView(UiComponents.compactButton(this, "SCARICA (${pack.botNick} #${pack.packNumber})", "#16A34A") {
                 ircEngine?.requestPack(pack.botNick, pack.packNumber)
                 Toast.makeText(this@MainActivity, "Richiesto #${pack.packNumber} a ${pack.botNick}", Toast.LENGTH_SHORT).show()
             })
@@ -1105,12 +1078,61 @@ class MainActivity : Activity() {
     }
 
     // =========================================================================
-    // 5. SCHERMATA FILE & VLC (ACCANTO A OPZIONI!)
+    // 5. SCHERMATA FILE & VLC (MOSTRA SEPARATAMENTE I TRASFERIMENTI EMULE E TORRENT)
     // =========================================================================
     private fun buildFilesVlcScreen(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
 
+            // --- BOX 1: MOTORE EMULE (ED2K / KAD) ---
+            activeEd2kBoxInFiles = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.parseColor("#1D283A"))
+                setPadding(20, 16, 20, 16)
+                val lp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+                lp.setMargins(0, 0, 0, 14)
+                layoutParams = lp
+            }
+
+            activeEd2kBoxInFiles.addView(TextView(this@MainActivity).apply {
+                text = "MOTORE EMULE (eD2K / KAD)"
+                textSize = 12f
+                setTextColor(Color.parseColor("#4ADE80"))
+                setTypeface(null, Typeface.BOLD)
+            })
+
+            activeEd2kTitleInFiles = UiComponents.infoLabel(this@MainActivity, "Nessun trasferimento eMule attivo.")
+            activeEd2kProgressInFiles = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
+                max = 100
+                progress = 0
+            }
+            activeEd2kPreviewHolder = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+
+            val ed2kCtrlRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            ed2kCtrlRow.addView(UiComponents.compactRowButton(this@MainActivity, "PAUSA / MANTIENI .PART", "#374151", 1f) {
+                Ed2kKadManager.stopCurrentDownload(deletePart = false)
+                refreshDownloadedAndIncompleteFiles()
+            })
+            ed2kCtrlRow.addView(UiComponents.compactRowButton(this@MainActivity, "ANNULLA ED ELIMINA", "#991B1B", 1f) {
+                Ed2kKadManager.stopCurrentDownload(deletePart = true)
+                activeEd2kPreviewHolder.removeAllViews()
+                refreshDownloadedAndIncompleteFiles()
+            })
+
+            activeEd2kBoxInFiles.addView(activeEd2kTitleInFiles)
+            activeEd2kBoxInFiles.addView(activeEd2kProgressInFiles)
+            activeEd2kBoxInFiles.addView(activeEd2kPreviewHolder)
+            activeEd2kBoxInFiles.addView(ed2kCtrlRow)
+            addView(activeEd2kBoxInFiles)
+
+            // --- BOX 2: MOTORE BITTORRENT ---
             activeDownloadBoxInFiles = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 setBackgroundColor(Color.parseColor("#182232"))
@@ -1124,13 +1146,13 @@ class MainActivity : Activity() {
             }
 
             activeDownloadBoxInFiles.addView(TextView(this@MainActivity).apply {
-                text = "TRASFERIMENTO IN CORSO"
+                text = "MOTORE BITTORRENT (DHT / MAGNET)"
                 textSize = 12f
                 setTextColor(Color.parseColor("#38BDF8"))
                 setTypeface(null, Typeface.BOLD)
             })
 
-            activeDownloadTitleInFiles = infoLabel("Nessun download attivo.")
+            activeDownloadTitleInFiles = UiComponents.infoLabel(this@MainActivity, "Nessun download BitTorrent attivo.")
             activeDownloadProgressInFiles = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
                 max = 100
                 progress = 0
@@ -1143,11 +1165,11 @@ class MainActivity : Activity() {
             val dlCtrlRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
             }
-            dlCtrlRow.addView(compactRowButton("PAUSA / MANTIENI", "#374151", 1f) {
+            dlCtrlRow.addView(UiComponents.compactRowButton(this@MainActivity, "PAUSA / MANTIENI", "#374151", 1f) {
                 torrentEngine.stopKeepFiles()
                 refreshDownloadedAndIncompleteFiles()
             })
-            dlCtrlRow.addView(compactRowButton("ANNULLA ED ELIMINA", "#991B1B", 1f) {
+            dlCtrlRow.addView(UiComponents.compactRowButton(this@MainActivity, "ANNULLA ED ELIMINA", "#991B1B", 1f) {
                 torrentEngine.stopAndClearCache()
                 activeDownloadPreviewHolderInFiles.removeAllViews()
                 refreshDownloadedAndIncompleteFiles()
@@ -1159,8 +1181,8 @@ class MainActivity : Activity() {
             activeDownloadBoxInFiles.addView(dlCtrlRow)
             addView(activeDownloadBoxInFiles)
 
-            addView(sectionTitle("Archivio File Scaricati (Incoming) e Incompleti (Temp)"))
-            addView(compactButton("AGGIORNA ELENCO FILE", "#2563EB") {
+            addView(UiComponents.sectionTitle(this@MainActivity, "Archivio File Scaricati (Incoming) e Incompleti (Temp)"))
+            addView(UiComponents.compactButton(this@MainActivity, "AGGIORNA ELENCO FILE", "#2563EB") {
                 refreshDownloadedAndIncompleteFiles()
             })
 
@@ -1172,25 +1194,65 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun observeEd2kEngineState() {
+        mainScope.launch {
+            Ed2kKadManager.transferState.collect { state ->
+                when (state) {
+                    is Ed2kTransferState.Idle -> {
+                        activeEd2kTitleInFiles.text = "Nessun trasferimento eMule attivo."
+                        activeEd2kProgressInFiles.progress = 0
+                    }
+                    is Ed2kTransferState.Downloading -> {
+                        val info = "${state.fileName}\n${state.statusText} | ${state.speedKbps} KB/s | Fonti: ${state.activeSources}"
+                        activeEd2kTitleInFiles.text = info
+                        activeEd2kProgressInFiles.progress = state.progressPercent
+                        activeEd2kPreviewHolder.removeAllViews()
+                        if (state.partFile.exists() && state.partFile.length() > 0L) {
+                            activeEd2kPreviewHolder.addView(
+                                UiComponents.compactButton(this@MainActivity, "ANTEPRIMA LIBVLC (.PART)", "#0284C7") {
+                                    UiComponents.openFullscreenVlcDialog(this@MainActivity, vlcManager, state.partFile)
+                                }
+                            )
+                        }
+                    }
+                    is Ed2kTransferState.Completed -> {
+                        activeEd2kProgressInFiles.progress = 100
+                        activeEd2kTitleInFiles.text = "Completato in Incoming: ${state.fileName}"
+                        activeEd2kPreviewHolder.removeAllViews()
+                        activeEd2kPreviewHolder.addView(
+                            UiComponents.compactButton(this@MainActivity, "APRI CON LIBVLC", "#16A34A") {
+                                UiComponents.openFullscreenVlcDialog(this@MainActivity, vlcManager, state.finalFile)
+                            }
+                        )
+                        refreshDownloadedAndIncompleteFiles()
+                    }
+                    is Ed2kTransferState.Error -> {
+                        activeEd2kTitleInFiles.text = state.message
+                    }
+                }
+            }
+        }
+    }
+
     private fun observeTorrentEngineState() {
         mainScope.launch {
             torrentEngine.state.collect { state ->
                 when (state) {
                     is TorrentStreamState.Idle -> {
-                        activeDownloadTitleInFiles.text = "Nessun trasferimento attivo."
+                        activeDownloadTitleInFiles.text = "Nessun download BitTorrent attivo."
                         activeDownloadProgressInFiles.progress = 0
                         torrentStatusText.text = "Stato: Inattivo"
                         torrentProgressBar.progress = 0
                     }
                     is TorrentStreamState.Buffering -> {
-                        val info = "${state.torrentTitle}\n${state.statusText} | ${state.downloadSpeedKbps} KB/s | Fonti: ${state.peers}"
+                        val info = "${state.torrentTitle}\n${state.statusText} | ${state.downloadSpeedKbps} KB/s | Peer: ${state.peers}"
                         activeDownloadProgressInFiles.progress = state.progressPercent
                         activeDownloadTitleInFiles.text = info
                         torrentProgressBar.progress = state.progressPercent
                         torrentStatusText.text = info
                         P2PEngineService.updateNotificationStatus(
                             this@MainActivity,
-                            "Download: ${state.progressPercent}% (${state.downloadSpeedKbps} KB/s)"
+                            "Torrent: ${state.progressPercent}% (${state.downloadSpeedKbps} KB/s)"
                         )
                     }
                     is TorrentStreamState.Ready -> {
@@ -1202,8 +1264,8 @@ class MainActivity : Activity() {
 
                         activeDownloadPreviewHolderInFiles.removeAllViews()
                         activeDownloadPreviewHolderInFiles.addView(
-                            compactButton("APRI ANTEPRIMA LIBVLC", "#16A34A") {
-                                openFullscreenVlcDialog(state.videoFile)
+                            UiComponents.compactButton(this@MainActivity, "APRI ANTEPRIMA LIBVLC", "#16A34A") {
+                                UiComponents.openFullscreenVlcDialog(this@MainActivity, vlcManager, state.videoFile)
                             }
                         )
                         refreshDownloadedAndIncompleteFiles()
@@ -1219,13 +1281,13 @@ class MainActivity : Activity() {
 
     private fun refreshDownloadedAndIncompleteFiles() {
         filesListContainer.removeAllViews()
-        val base = File(getBaseMulePath())
+        val base = File(UiComponents.getBaseMulePath(this))
         val tempFiles = File(base, "Temp").walkTopDown().filter { it.isFile }.toList()
         val incomingFiles = File(base, "Incoming").walkTopDown().filter { it.isFile }.toList()
         val allFiles = (tempFiles + incomingFiles).sortedByDescending { it.lastModified() }
 
         if (allFiles.isEmpty()) {
-            filesListContainer.addView(infoLabel("Nessun file presente in Temp o Incoming."))
+            filesListContainer.addView(UiComponents.infoLabel(this, "Nessun file presente in Temp o Incoming."))
             return
         }
 
@@ -1263,9 +1325,15 @@ class MainActivity : Activity() {
             val btnRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
             }
-            btnRow.addView(compactRowButton("ANTEPRIMA VLC", "#0284C7", 1f) { openFullscreenVlcDialog(file) })
-            btnRow.addView(compactRowButton("APRI", "#16A34A", 1f) { openFileDirectly(file) })
-            btnRow.addView(compactRowButton("ELIMINA", "#991B1B", 1f) { confirmAndDeleteFile(file) })
+            btnRow.addView(UiComponents.compactRowButton(this, "ANTEPRIMA VLC", "#0284C7", 1f) {
+                UiComponents.openFullscreenVlcDialog(this, vlcManager, file)
+            })
+            btnRow.addView(UiComponents.compactRowButton(this, "APRI", "#16A34A", 1f) {
+                UiComponents.openFileDirectly(this, vlcManager, file)
+            })
+            btnRow.addView(UiComponents.compactRowButton(this, "ELIMINA", "#991B1B", 1f) {
+                confirmAndDeleteFile(file)
+            })
 
             rowCard.addView(btnRow)
             filesListContainer.addView(rowCard)
@@ -1283,429 +1351,6 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Annulla", null)
             .show()
-    }
-
-    private fun openFullscreenVlcDialog(file: File) {
-        if (!file.exists() || file.length() == 0L) {
-            Toast.makeText(this, "File ancora a 0 byte, attendi qualche secondo.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.BLACK)
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
-
-        val topBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.parseColor("#181C24"))
-            setPadding(20, 12, 20, 12)
-        }
-
-        topBar.addView(TextView(this).apply {
-            text = file.name
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        })
-
-        topBar.addView(compactRowButton("CHIUDI", "#991B1B", 0f) {
-            vlcManager.stopAndDetach()
-            dialog.dismiss()
-        })
-        root.addView(topBar)
-
-        val videoContainer = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-        }
-
-        val vlcLayout = LayoutInflater.from(this)
-            .inflate(R.layout.vlc_player_container, videoContainer, false) as VLCVideoLayout
-        videoContainer.addView(vlcLayout)
-        root.addView(videoContainer)
-
-        val audioStatus = TextView(this).apply {
-            text = "Riproduzione LibVLC: ${file.name}"
-            textSize = 11f
-            setTextColor(Color.parseColor("#38BDF8"))
-            setBackgroundColor(Color.parseColor("#111318"))
-            setPadding(20, 10, 20, 10)
-        }
-        root.addView(audioStatus)
-
-        val bottomControls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.parseColor("#181C24"))
-            setPadding(10, 8, 10, 8)
-        }
-
-        bottomControls.addView(compactRowButton("PLAY/PAUSA", "#2563EB", 1f) { vlcManager.togglePlayPause() })
-        bottomControls.addView(compactRowButton("-15s", "#374151", 1f) { vlcManager.seekBy(-15_000L) })
-        bottomControls.addView(compactRowButton("+15s", "#374151", 1f) { vlcManager.seekBy(15_000L) })
-        bottomControls.addView(compactRowButton("16:9", "#374151", 1f) { vlcManager.applyAspectRatioAndScale(vlcLayout, "16:9") })
-        bottomControls.addView(compactRowButton("FILL", "#374151", 1f) { vlcManager.applyAspectRatioAndScale(vlcLayout, "FILL") })
-
-        root.addView(bottomControls)
-
-        dialog.setContentView(root)
-        dialog.setOnDismissListener { vlcManager.stopAndDetach() }
-
-        dialog.setOnShowListener {
-            vlcLayout.postDelayed({
-                vlcManager.attachAndPrepare(
-                    layout = vlcLayout,
-                    streamUrl = file.absolutePath,
-                    onAudioTracksUpdated = { _, _, info ->
-                        runOnUiThread { audioStatus.text = "Traccia Audio: $info" }
-                    },
-                    onError = {
-                        runOnUiThread { audioStatus.text = "Formato non video o header ancora incompleto." }
-                    }
-                )
-            }, 200L)
-        }
-
-        dialog.show()
-    }
-
-    private fun openFileDirectly(file: File) {
-        val ext = file.extension.lowercase()
-        val videoExts = setOf("mp4", "mkv", "avi", "ts", "webm", "mov", "m4v", "flv", "mpg", "mpeg", "part")
-        if (ext in videoExts) {
-            openFullscreenVlcDialog(file)
-            return
-        }
-
-        try {
-            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(Uri.fromFile(file), mime)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            startActivity(Intent.createChooser(intent, "Apri ${file.name}"))
-        } catch (_: Exception) {
-            Toast.makeText(this, "Nessuna app trovata per aprire .$ext", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    // =========================================================================
-    // 6. SCHERMATA OPZIONI COMPLETA: EMULE + UTORRENT + mIRC (CON OFFUSCAMENTO IP)
-    // =========================================================================
-    private fun buildSettingsScreen(): LinearLayout {
-        val prefs = getSharedPreferences("UltimateMulePrefs", Context.MODE_PRIVATE)
-        val defaultPath = File(Environment.getExternalStorageDirectory(), "UltimateMule").absolutePath
-        val savedPath = prefs.getString("custom_download_path", defaultPath) ?: defaultPath
-
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-
-            // --- CARTELLA DI SALVATAGGIO ---
-            addView(sectionTitle("Cartella Principale di Salvataggio (Incoming / Temp / Config)"))
-            val pathRow = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            val folderInput = styledEditText(savedPath).apply {
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    setMargins(0, 4, 6, 4)
-                }
-            }
-            pathRow.addView(folderInput)
-            pathRow.addView(compactRowButton("APPLICA", "#16A34A", 0f) {
-                val chosen = folderInput.text.toString().trim()
-                prefs.edit().putString("custom_download_path", chosen).apply()
-                verifyAndCreateFolders(chosen)
-            })
-            addView(pathRow)
-
-            // =================================================================
-            // SEZIONE 1: CONFIGURAZIONE COMPLETA eMule (eD2K / KAD)
-            // =================================================================
-            addView(sectionTitle("1. Impostazioni Complete eMule (eD2K & KAD)"))
-            val emuleTcp = styledEditText(prefs.getString("emule_tcp", "4662") ?: "4662")
-            val emuleUdp = styledEditText(prefs.getString("emule_udp", "4672") ?: "4672")
-            val emuleMaxSources = styledEditText(prefs.getString("emule_max_sources", "1500") ?: "1500")
-            val emuleMaxConn = styledEditText(prefs.getString("emule_max_conn", "500") ?: "500")
-            val emuleDlLimit = styledEditText(prefs.getString("emule_dl_limit", "0") ?: "0")
-            val emuleUlLimit = styledEditText(prefs.getString("emule_ul_limit", "0") ?: "0")
-
-            addView(twoColumnFields("Porta TCP Client:", emuleTcp, "Porta UDP KAD:", emuleUdp))
-            addView(twoColumnFields("Fonti Max per File:", emuleMaxSources, "Connessioni Max:", emuleMaxConn))
-            addView(twoColumnFields("Limite Download (KB/s, 0=Inf):", emuleDlLimit, "Limite Upload (KB/s, 0=Inf):", emuleUlLimit))
-
-            val chkEmuleObf = CheckBox(this@MainActivity).apply {
-                text = "Offuscamento Protocollo Criptato (Anti-blocco ISP)"
-                isChecked = prefs.getBoolean("emule_obfuscation", true)
-                setTextColor(Color.WHITE)
-                textSize = 12f
-            }
-            val chkEmuleGzip = CheckBox(this@MainActivity).apply {
-                text = "Compressione Pacchetti GZIP / Zlib Nativa"
-                isChecked = prefs.getBoolean("emule_gzip", true)
-                setTextColor(Color.WHITE)
-                textSize = 12f
-            }
-            val chkEmulePreview = CheckBox(this@MainActivity).apply {
-                text = "Scarica prima il primo e l'ultimo chunk per anteprima LibVLC"
-                isChecked = prefs.getBoolean("emule_preview_chunks", true)
-                setTextColor(Color.WHITE)
-                textSize = 12f
-            }
-            val chkEmuleDeadSrv = CheckBox(this@MainActivity).apply {
-                text = "Rimuovi automaticamente i Server inattivi (0 utenti)"
-                isChecked = prefs.getBoolean("emule_remove_dead", true)
-                setTextColor(Color.WHITE)
-                textSize = 12f
-            }
-            addView(chkEmuleObf)
-            addView(chkEmuleGzip)
-            addView(chkEmulePreview)
-            addView(chkEmuleDeadSrv)
-
-            // =================================================================
-            // SEZIONE 2: CONFIGURAZIONE COMPLETA uTorrent (BitTorrent / DHT)
-            // =================================================================
-            addView(sectionTitle("2. Impostazioni Complete uTorrent (BitTorrent / DHT)"))
-            val utMaxConn = styledEditText(prefs.getString("ut_max_conn", "300") ?: "300")
-            val utMaxActive = styledEditText(prefs.getString("ut_max_active", "6") ?: "6")
-            val utDlLimit = styledEditText(prefs.getString("ut_dl_limit", "0") ?: "0")
-            val utUlLimit = styledEditText(prefs.getString("ut_ul_limit", "0") ?: "0")
-
-            addView(twoColumnFields("Peer Max Globali:", utMaxConn, "Download Attivi Simultanei:", utMaxActive))
-            addView(twoColumnFields("Limite Download (KB/s):", utDlLimit, "Limite Upload (KB/s):", utUlLimit))
-
-            val chkUtDht = CheckBox(this@MainActivity).apply {
-                text = "Abilita Rete DHT Decentralizzata & Peer Exchange (PEX)"
-                isChecked = prefs.getBoolean("ut_dht", true)
-                setTextColor(Color.WHITE)
-                textSize = 12f
-            }
-            val chkUtSequential = CheckBox(this@MainActivity).apply {
-                text = "Download Sequenziale + Boost Atomi MP4/MKV per VLC"
-                isChecked = prefs.getBoolean("ut_seq", true)
-                setTextColor(Color.WHITE)
-                textSize = 12f
-            }
-            addView(chkUtDht)
-            addView(chkUtSequential)
-
-            // =================================================================
-            // SEZIONE 3: CONFIGURAZIONE COMPLETA mIRC & PROTEZIONE OFFUSCAMENTO IP
-            // =================================================================
-            addView(sectionTitle("3. Impostazioni Complete mIRC & Scudo Offuscamento IP"))
-            val ircNick = styledEditText(prefs.getString("irc_nick", "MuleAnon") ?: "MuleAnon")
-            val ircPort = styledEditText(prefs.getString("irc_port", "6667") ?: "6667")
-            val ircProxyHost = styledEditText(prefs.getString("irc_proxy_host", "") ?: "").apply {
-                hint = "Opzionale: IP Proxy SOCKS5 / Tor (es. 127.0.0.1)"
-            }
-            val ircProxyPort = styledEditText(prefs.getString("irc_proxy_port", "") ?: "").apply {
-                hint = "Porta Proxy (es. 9050)"
-            }
-
-            addView(twoColumnFields("Nickname IRC:", ircNick, "Porta IRC (6667 / 6697):", ircPort))
-            addView(twoColumnFields("Proxy SOCKS5/Tor IP:", ircProxyHost, "Porta SOCKS5/Tor:", ircProxyPort))
-
-            val chkIrcCloak = CheckBox(this@MainActivity).apply {
-                text = "Offuscamento IP Automatico nelle Chat (MODE +ix Host Cloaking)"
-                isChecked = prefs.getBoolean("irc_ip_cloak", true)
-                setTextColor(Color.WHITE)
-                textSize = 12f
-            }
-            val chkIrcBlockCtcp = CheckBox(this@MainActivity).apply {
-                text = "Blocca Tracciamento Posizione/Sistema (Anti-CTCP Leak)"
-                isChecked = prefs.getBoolean("irc_block_ctcp", true)
-                setTextColor(Color.WHITE)
-                textSize = 12f
-            }
-            val chkIrcSsl = CheckBox(this@MainActivity).apply {
-                text = "Usa Connessione Criptata SSL/TLS (Porta 6697)"
-                isChecked = prefs.getBoolean("irc_ssl", false)
-                setTextColor(Color.WHITE)
-                textSize = 12f
-            }
-            addView(chkIrcCloak)
-            addView(chkIrcBlockCtcp)
-            addView(chkIrcSsl)
-
-            addView(compactButton("SALVA TUTTE LE CONFIGURAZIONI (eMule / uTorrent / mIRC)", "#0284C7") {
-                prefs.edit()
-                    .putString("emule_tcp", emuleTcp.text.toString().trim())
-                    .putString("emule_udp", emuleUdp.text.toString().trim())
-                    .putString("emule_max_sources", emuleMaxSources.text.toString().trim())
-                    .putString("emule_max_conn", emuleMaxConn.text.toString().trim())
-                    .putString("emule_dl_limit", emuleDlLimit.text.toString().trim())
-                    .putString("emule_ul_limit", emuleUlLimit.text.toString().trim())
-                    .putBoolean("emule_obfuscation", chkEmuleObf.isChecked)
-                    .putBoolean("emule_gzip", chkEmuleGzip.isChecked)
-                    .putBoolean("emule_preview_chunks", chkEmulePreview.isChecked)
-                    .putBoolean("emule_remove_dead", chkEmuleDeadSrv.isChecked)
-                    .putString("ut_max_conn", utMaxConn.text.toString().trim())
-                    .putString("ut_max_active", utMaxActive.text.toString().trim())
-                    .putString("ut_dl_limit", utDlLimit.text.toString().trim())
-                    .putString("ut_ul_limit", utUlLimit.text.toString().trim())
-                    .putBoolean("ut_dht", chkUtDht.isChecked)
-                    .putBoolean("ut_seq", chkUtSequential.isChecked)
-                    .putString("irc_nick", ircNick.text.toString().trim())
-                    .putString("irc_port", ircPort.text.toString().trim())
-                    .putString("irc_proxy_host", ircProxyHost.text.toString().trim())
-                    .putString("irc_proxy_port", ircProxyPort.text.toString().trim())
-                    .putBoolean("irc_ip_cloak", chkIrcCloak.isChecked)
-                    .putBoolean("irc_block_ctcp", chkIrcBlockCtcp.isChecked)
-                    .putBoolean("irc_ssl", chkIrcSsl.isChecked)
-                    .apply()
-                Toast.makeText(this@MainActivity, "Tutte le impostazioni sono state salvate!", Toast.LENGTH_SHORT).show()
-            })
-        }
-    }
-
-    private fun twoColumnFields(label1: String, input1: EditText, label2: String, input2: EditText): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            val col1 = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    setMargins(0, 0, 6, 0)
-                }
-                addView(infoLabel(label1))
-                addView(input1)
-            }
-            val col2 = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    setMargins(6, 0, 0, 0)
-                }
-                addView(infoLabel(label2))
-                addView(input2)
-            }
-            addView(col1)
-            addView(col2)
-        }
-    }
-
-    // =========================================================================
-    // COMPONENTI UI COMPATTI E PROFESSIONALI
-    // =========================================================================
-    private fun styledEditText(initial: String): EditText {
-        return EditText(this).apply {
-            setText(initial)
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#6B7280"))
-            setBackgroundColor(Color.parseColor("#1E2430"))
-            setPadding(18, 12, 18, 12)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-            lp.setMargins(0, 4, 0, 8)
-            layoutParams = lp
-        }
-    }
-
-    private fun compactButton(label: String, hexColor: String, onClick: () -> Unit): Button {
-        return Button(this).apply {
-            text = label
-            textSize = 11f
-            minHeight = 0
-            minimumHeight = 0
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor(hexColor))
-            setPadding(16, 12, 16, 12)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-            lp.setMargins(0, 6, 0, 6)
-            layoutParams = lp
-            setOnClickListener { onClick() }
-        }
-    }
-
-    private fun compactRowButton(label: String, hexColor: String, weight: Float, onClick: () -> Unit): Button {
-        return Button(this).apply {
-            text = label
-            textSize = 10f
-            minHeight = 0
-            minimumHeight = 0
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor(hexColor))
-            setPadding(14, 12, 14, 12)
-            val lp = if (weight > 0f) {
-                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, weight)
-            } else {
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            }
-            lp.setMargins(4, 4, 4, 4)
-            layoutParams = lp
-            setOnClickListener { onClick() }
-        }
-    }
-
-    private fun sectionTitle(text: String): TextView {
-        return TextView(this).apply {
-            this.text = text
-            textSize = 13f
-            setTextColor(Color.parseColor("#38BDF8"))
-            setTypeface(null, Typeface.BOLD)
-            setPadding(0, 16, 0, 4)
-        }
-    }
-
-    private fun infoLabel(text: String): TextView {
-        return TextView(this).apply {
-            this.text = text
-            textSize = 11f
-            setTextColor(Color.parseColor("#9CA3AF"))
-            setPadding(0, 2, 0, 4)
-        }
-    }
-
-    private fun getBaseMulePath(): String {
-        val prefs = getSharedPreferences("UltimateMulePrefs", Context.MODE_PRIVATE)
-        val def = File(Environment.getExternalStorageDirectory(), "UltimateMule").absolutePath
-        return prefs.getString("custom_download_path", def) ?: def
-    }
-
-    private fun verifyAndCreateFolders(basePath: String) {
-        if (Environment.isExternalStorageManager()) {
-            val baseDir = File(basePath)
-            File(baseDir, "Incoming").mkdirs()
-            File(baseDir, "Temp").mkdirs()
-            File(baseDir, "Config").mkdirs()
-            Toast.makeText(this, "Cartelle create in: ${baseDir.absolutePath}", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun requestAllFilesAccess() {
-        if (!Environment.isExternalStorageManager()) {
-            try {
-                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                intent.data = Uri.parse("package:$packageName")
-                startActivity(intent)
-            } catch (_: Exception) {
-                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-            }
-        }
-    }
-
-    private fun disableBatteryOptimization() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-            intent.data = Uri.parse("package:$packageName")
-            startActivity(intent)
-        }
     }
 
     override fun onDestroy() {
