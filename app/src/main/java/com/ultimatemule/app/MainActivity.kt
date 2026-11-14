@@ -53,10 +53,11 @@ class MainActivity : Activity() {
 
     private val mainScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
-    // Contenitori delle 5 schermate principali
+    // Le 6 Sezioni Ben Separate (Torrent separato da File & VLC!)
     private lateinit var screenNetworks: LinearLayout
     private lateinit var screenSearch: LinearLayout
-    private lateinit var screenTransfers: LinearLayout
+    private lateinit var screenTorrent: LinearLayout
+    private lateinit var screenFilesVlc: LinearLayout
     private lateinit var screenIrc: LinearLayout
     private lateinit var screenSettings: LinearLayout
 
@@ -67,8 +68,9 @@ class MainActivity : Activity() {
     private lateinit var folderInput: EditText
     private lateinit var serverListLog: TextView
     private lateinit var searchResultsContainer: LinearLayout
-    private lateinit var transfersStatusText: TextView
-    private lateinit var transfersProgressBar: ProgressBar
+    private lateinit var torrentStatusText: TextView
+    private lateinit var torrentProgressBar: ProgressBar
+    private lateinit var currentTorrentFileBtnContainer: LinearLayout
     private lateinit var filesListContainer: LinearLayout
 
     // Riferimenti mIRC
@@ -84,34 +86,51 @@ class MainActivity : Activity() {
     private var ircEngine: IrcXdccEngine? = null
     private lateinit var vlcManager: VlcPlayerManager
     private lateinit var torrentEngine: TorrentStreamEngine
-    private val searchEngine = GlobalSearchEngine()
+    private lateinit var searchEngine: GlobalSearchEngine
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Permette l'apertura diretta dei file nella cartella Incoming con app esterne
         StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
-
         requestNotificationPermissionIfNeeded()
 
         vlcManager = VlcPlayerManager(this)
         torrentEngine = TorrentStreamEngine(this)
+        searchEngine = GlobalSearchEngine(File(getBaseMulePath(), "Config"))
 
         val rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#111318"))
         }
 
-        // --- BARRA DI STATO SUPERIORE PULITA (SENZA EMOJI) ---
-        topStatusBanner = TextView(this).apply {
-            text = "UltimateMule  |  eD2K: In attesa  |  KAD: Pronto  |  IRC: Offline"
-            textSize = 13f
-            setTextColor(Color.parseColor("#E5E7EB"))
+        // --- BARRA SUPERIORE CON STATO E PULSANTE RAPIDO DISCONNETTI ---
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Color.parseColor("#1E2430"))
-            setPadding(32, 26, 32, 26)
-            setTypeface(null, Typeface.BOLD)
+            setPadding(24, 18, 24, 18)
         }
-        rootLayout.addView(topStatusBanner)
+
+        topStatusBanner = TextView(this).apply {
+            text = "UltimateMule  |  Reti Pronte"
+            textSize = 12f
+            setTextColor(Color.parseColor("#E5E7EB"))
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val btnQuickDisconnect = Button(this).apply {
+            text = "SCOLLEGA RETI"
+            textSize = 10f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#991B1B"))
+            setPadding(18, 10, 18, 10)
+            setOnClickListener { disconnectAllNetworks() }
+        }
+
+        topBar.addView(topStatusBanner)
+        topBar.addView(btnQuickDisconnect)
+        rootLayout.addView(topBar)
 
         // --- AREA CENTRALE SCORREVOLE ---
         val contentScroll = ScrollView(this).apply {
@@ -121,25 +140,27 @@ class MainActivity : Activity() {
         }
         val contentHolder = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(32, 28, 32, 40)
+            setPadding(28, 24, 28, 36)
         }
 
         screenNetworks = buildNetworksScreen()
         screenSearch = buildSearchScreen()
-        screenTransfers = buildTransfersScreen()
+        screenTorrent = buildTorrentScreen()
+        screenFilesVlc = buildFilesVlcScreen()
         screenIrc = buildIrcScreen()
         screenSettings = buildSettingsScreen()
 
         contentHolder.addView(screenNetworks)
         contentHolder.addView(screenSearch)
-        contentHolder.addView(screenTransfers)
+        contentHolder.addView(screenTorrent)
+        contentHolder.addView(screenFilesVlc)
         contentHolder.addView(screenIrc)
         contentHolder.addView(screenSettings)
 
         contentScroll.addView(contentHolder)
         rootLayout.addView(contentScroll)
 
-        // --- BARRA DI NAVIGAZIONE INFERIORE CON ICONE VETTORIALI ---
+        // --- BARRA DI NAVIGAZIONE INFERIORE A 6 ICONE VETTORIALI (CON TORRENT SEPARATO!) ---
         val bottomNav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.parseColor("#181C24"))
@@ -151,9 +172,10 @@ class MainActivity : Activity() {
 
         bottomNav.addView(createBottomNavItem(R.drawable.ic_networks, "Reti", 0))
         bottomNav.addView(createBottomNavItem(R.drawable.ic_search, "Cerca", 1))
-        bottomNav.addView(createBottomNavItem(R.drawable.ic_transfers, "File & VLC", 2))
-        bottomNav.addView(createBottomNavItem(R.drawable.ic_irc, "mIRC", 3))
-        bottomNav.addView(createBottomNavItem(R.drawable.ic_settings, "Opzioni", 4))
+        bottomNav.addView(createBottomNavItem(R.drawable.ic_torrent, "Torrent", 2))
+        bottomNav.addView(createBottomNavItem(R.drawable.ic_transfers, "File & VLC", 3))
+        bottomNav.addView(createBottomNavItem(R.drawable.ic_irc, "mIRC", 4))
+        bottomNav.addView(createBottomNavItem(R.drawable.ic_settings, "Opzioni", 5))
 
         rootLayout.addView(bottomNav)
         setContentView(rootLayout)
@@ -167,19 +189,19 @@ class MainActivity : Activity() {
         val item = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setPadding(8, 20, 8, 20)
+            setPadding(4, 18, 4, 18)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             setOnClickListener { selectScreen(index) }
         }
 
         val icon = ImageView(this).apply {
             setImageResource(iconRes)
-            layoutParams = LinearLayout.LayoutParams(54, 54)
+            layoutParams = LinearLayout.LayoutParams(48, 48)
         }
 
         val text = TextView(this).apply {
             this.text = label
-            textSize = 11f
+            textSize = 10f
             setTextColor(Color.parseColor("#9CA3AF"))
             gravity = Gravity.CENTER
             setPadding(0, 6, 0, 0)
@@ -194,9 +216,10 @@ class MainActivity : Activity() {
     private fun selectScreen(index: Int) {
         screenNetworks.visibility = if (index == 0) View.VISIBLE else View.GONE
         screenSearch.visibility = if (index == 1) View.VISIBLE else View.GONE
-        screenTransfers.visibility = if (index == 2) View.VISIBLE else View.GONE
-        screenIrc.visibility = if (index == 3) View.VISIBLE else View.GONE
-        screenSettings.visibility = if (index == 4) View.VISIBLE else View.GONE
+        screenTorrent.visibility = if (index == 2) View.VISIBLE else View.GONE
+        screenFilesVlc.visibility = if (index == 3) View.VISIBLE else View.GONE
+        screenIrc.visibility = if (index == 4) View.VISIBLE else View.GONE
+        screenSettings.visibility = if (index == 5) View.VISIBLE else View.GONE
 
         navItems.forEachIndexed { idx, layout ->
             val icon = layout.getChildAt(0) as ImageView
@@ -214,133 +237,188 @@ class MainActivity : Activity() {
             }
         }
 
-        if (index == 2) {
+        if (index == 3) {
             refreshDownloadedAndIncompleteFiles()
         }
     }
 
+    /**
+     * Scollega completamente l'app da tutte le reti (KAD, Server eD2K, Torrent, IRC) e ferma il servizio
+     */
+    private fun disconnectAllNetworks() {
+        Ed2kKadManager.disconnectAll()
+        ircEngine?.disconnect()
+        ircEngine = null
+        torrentEngine.stopKeepFiles()
+        vlcManager.stopAndDetach()
+        stopService(Intent(this, P2PEngineService::class.java))
+
+        topStatusBanner.text = "UltimateMule  |  DISCONNESSO DA TUTTE LE RETI"
+        appendServerLog("Tutte le connessioni (KAD, Server eD2K, IRC, Torrent) sono state chiuse.")
+        Toast.makeText(this, "Scollegato da tutte le reti P2P.", Toast.LENGTH_LONG).show()
+    }
+
     // =========================================================================
-    // 1. SCHERMATA RETI: SERVER eD2K (server.met) + KAD (nodes.dat)
+    // 1. SCHERMATA RETI: MULTI-SERVER.MET + MULTI-NODES.DAT (KAD) + DISCONNETTI
     // =========================================================================
     private fun buildNetworksScreen(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
 
-            addView(sectionTitle("Rete KAD Serverless (nodes.dat)"))
-            addView(infoLabel("KAD funziona anche senza server centrali. Connettendola insieme ai Server eD2K ottieni il massimo delle fonti disponibili."))
+            addView(sectionTitle("Controllo Connessione Globale eMule"))
+            val topActions = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
 
-            val kadUrlInput = styledEditText("http://upd.emule-security.org/nodes.dat")
-            addView(kadUrlInput)
+            val kadUrlsInput = styledEditText(
+                "http://upd.emule-security.org/nodes.dat\n" +
+                "http://www.nodes-dat.com/dl.php?load=nodes&trace=1"
+            ).apply { minLines = 2 }
 
-            addView(styledButton("CONNETTI RETE KAD (SCARICA NODES.DAT)", "#0284C7") {
+            val serverUrlsInput = styledEditText(
+                "http://upd.emule-security.org/server.met\n" +
+                "http://www.server-met.de/dl.php?load=gz&trace=1\n" +
+                "http://peerates.net/servers.php"
+            ).apply { minLines = 3 }
+
+            topActions.addView(styledButton("CONNETTI TUTTO (SERVER + KAD)", "#16A34A") {
                 val configDir = File(getBaseMulePath(), "Config")
                 val manager = Ed2kKadManager(configDir)
                 mainScope.launch {
-                    val count = manager.importKadNodesDat(kadUrlInput.text.toString()) { log ->
+                    appendServerLog("Avvio connessione simultanea a tutti i Server eD2K + Nodi KAD...")
+                    val servers = manager.importMultipleServerMet(serverUrlsInput.text.toString().split("\n")) { log ->
                         runOnUiThread { appendServerLog(log) }
                     }
-                    if (count > 0) {
-                        topStatusBanner.text = "UltimateMule  |  KAD: Attiva ($count nodi)  |  eD2K: Pronto"
-                        P2PEngineService.updateNotificationStatus(
-                            this@MainActivity,
-                            "Rete KAD Attiva ($count nodi)"
-                        )
+                    val nodes = manager.importMultipleKadNodesDat(kadUrlsInput.text.toString().split("\n")) { log ->
+                        runOnUiThread { appendServerLog(log) }
                     }
+                    val totalUsers = servers.sumOf { it.users }
+                    topStatusBanner.text = "eD2K: ${servers.size} Server ($totalUsers ut.) | KAD: $nodes nodi"
+                    P2PEngineService.updateNotificationStatus(
+                        this@MainActivity,
+                        "Connesso: ${servers.size} Server eD2K | $nodes Nodi KAD"
+                    )
+                }
+            }.apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) })
+
+            topActions.addView(styledButton("DISCONNETTI RETI", "#991B1B") {
+                disconnectAllNetworks()
+            }.apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) })
+
+            addView(topActions)
+
+            addView(sectionTitle(" Sorgenti Multi-Nodi KAD (nodes.dat)"))
+            addView(infoLabel("Puoi inserire più link nodes.dat (uno per riga) per unire tutti i nodi KAD:"))
+            addView(kadUrlsInput)
+
+            addView(styledButton("AGGIORNA E UNISCI NODI KAD", "#0284C7") {
+                val configDir = File(getBaseMulePath(), "Config")
+                val manager = Ed2kKadManager(configDir)
+                mainScope.launch {
+                    val count = manager.importMultipleKadNodesDat(kadUrlsInput.text.toString().split("\n")) { log ->
+                        runOnUiThread { appendServerLog(log) }
+                    }
+                    topStatusBanner.text = "KAD Attiva ($count nodi) | Server eD2K: ${Ed2kKadManager.activeServers.size}"
                 }
             })
 
-            addView(sectionTitle("Lista Multipla Server eD2K (OkHttp + GZIP)"))
-            addView(infoLabel("Opzionale: importa e unisci più liste server.met contemporaneamente per velocizzare la ricerca iniziale delle fonti."))
+            addView(sectionTitle("Sorgenti Multi-Server eD2K (server.met + Server Mondiali Integrati)"))
+            addView(infoLabel("Unisce i server di tutte le liste server.met per interrogare il massimo numero di fonti durante la ricerca:"))
+            addView(serverUrlsInput)
 
-            val urlsInput = styledEditText(
-                "http://upd.emule-security.org/server.met\n" +
-                "http://www.gruk.org/server.met.gz"
-            ).apply { minLines = 3 }
-            addView(urlsInput)
-
-            addView(styledButton("IMPORTA E UNISCI SERVER.MET (GZIP)", "#2563EB") {
-                val urls = urlsInput.text.toString().split("\n")
+            addView(styledButton("IMPORTA E UNISCI TUTTI I SERVER (GZIP)", "#2563EB") {
+                val urls = serverUrlsInput.text.toString().split("\n")
                 val configDir = File(getBaseMulePath(), "Config")
                 val manager = Ed2kKadManager(configDir)
 
                 mainScope.launch {
-                    appendServerLog("Scaricamento liste server.met con GZIP...")
                     val servers = manager.importMultipleServerMet(urls) { log ->
                         runOnUiThread { appendServerLog(log) }
                     }
                     val totalUsers = servers.sumOf { it.users }
-                    topStatusBanner.text = "UltimateMule  |  eD2K: ${servers.size} Server ($totalUsers utenti)  |  KAD: Attiva"
-                    P2PEngineService.updateNotificationStatus(
-                        this@MainActivity,
-                        "eD2K: ${servers.size} Server ($totalUsers utenti) | KAD Attiva"
-                    )
-                    if (servers.isNotEmpty()) {
-                        appendServerLog("\n--- SERVER ED2K ATTIVI ---")
-                        servers.take(12).forEach { s ->
-                            appendServerLog("${s.name} [${s.ip}:${s.port}] - Utenti: ${s.users}")
-                        }
+                    val totalFiles = servers.sumOf { it.files }
+                    topStatusBanner.text = "eD2K: ${servers.size} Server ($totalUsers utenti) | KAD Attiva"
+                    appendServerLog("\n--- RIEPILOGO SERVER UNIFICATI (${servers.size} Server | $totalFiles File indicizzati) ---")
+                    servers.forEach { s ->
+                        appendServerLog("${s.name} [${s.ip}:${s.port}] - Utenti: ${s.users} - File: ${s.files}")
                     }
                 }
             })
 
             serverListLog = TextView(this@MainActivity).apply {
-                text = "Console Reti eD2K / KAD pronta."
-                textSize = 12f
+                text = "Premi 'CONNETTI TUTTO (SERVER + KAD)' per caricare tutti i server mondiali e i nodi KAD."
+                textSize = 11f
                 typeface = Typeface.MONOSPACE
                 setBackgroundColor(Color.parseColor("#0B0E14"))
                 setTextColor(Color.parseColor("#38BDF8"))
-                setPadding(24, 24, 24, 24)
+                setPadding(20, 20, 20, 20)
             }
             addView(serverListLog)
         }
     }
 
     private fun appendServerLog(msg: String) {
-        val clean = msg.replace(Regex("[^\\x20-\\x7E\\xA0-\\xFF\\n]"), "")
-        val lines = (serverListLog.text.toString().split("\n") + clean).takeLast(20)
+        val lines = (serverListLog.text.toString().split("\n") + msg).takeLast(22)
         serverListLog.text = lines.joinToString("\n")
     }
 
     // =========================================================================
-    // 2. SCHERMATA CERCA: RICERCA GLOBALE (TORRENT / IRC XDCC / ED2K-KAD)
+    // 2. SCHERMATA CERCA: FORMATO FILE VISIBILE + ISPEZIONE PRE-DOWNLOAD
     // =========================================================================
     private fun buildSearchScreen(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
 
-            addView(sectionTitle("Ricerca Globale File (KAD / Server / IRC XDCC / Torrent)"))
-            addView(infoLabel("Cerca per nome file oppure incolla un link diretto (ed2k:// o magnet:?):"))
+            addView(sectionTitle("Ricerca Globale Multi-Server eMule / KAD / Torrent / XDCC"))
+            addView(infoLabel("Scrivi il nome del file da cercare. Per ogni risultato vedrai il FORMATO (.MKV, .MP4, .AVI, .MP3, .RAR) e potrai ISPEZIONARE il contenuto prima di scaricare:"))
 
             val searchInput = styledEditText("").apply {
-                hint = "Inserisci nome film, audio, software o link..."
+                hint = "Es. nome film ita, album mp3, archivio rar..."
             }
             addView(searchInput)
 
-            val filterSpinner = Spinner(this@MainActivity).apply {
-                val options = listOf(
-                    "Tutte le Reti (Globale)",
-                    "Solo BitTorrent / DHT",
-                    "Solo Bot IRC XDCC",
-                    "Solo eD2K / KAD"
-                )
-                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, options)
-                setBackgroundColor(Color.parseColor("#262B36"))
+            val spinnersRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
             }
-            addView(filterSpinner)
 
-            addView(styledButton("AVVIA RICERCA", "#0284C7") {
+            val netSpinner = Spinner(this@MainActivity).apply {
+                val nets = listOf("Tutte le Reti", "Rete eD2K + KAD", "Rete BitTorrent", "Bot IRC XDCC")
+                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, nets)
+                setBackgroundColor(Color.parseColor("#262B36"))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            val catSpinner = Spinner(this@MainActivity).apply {
+                val cats = listOf("Tutti i Formati", "Video (MKV/MP4/AVI)", "Audio (MP3/FLAC)", "Archivi (RAR/ZIP/ISO)", "Programmi/Doc (APK/PDF)")
+                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, cats)
+                setBackgroundColor(Color.parseColor("#262B36"))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            spinnersRow.addView(netSpinner)
+            spinnersRow.addView(catSpinner)
+            addView(spinnersRow)
+
+            addView(styledButton("CERCA SU TUTTI I SERVER E NODI", "#0284C7") {
                 val query = searchInput.text.toString().trim()
                 if (query.isEmpty()) {
-                    Toast.makeText(this@MainActivity, "Inserisci un termine di ricerca", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Inserisci il nome del file da cercare", Toast.LENGTH_SHORT).show()
                     return@styledButton
                 }
-                val filter = when (filterSpinner.selectedItemPosition) {
-                    1 -> GlobalSearchEngine.NetworkType.TORRENT
-                    2 -> GlobalSearchEngine.NetworkType.IRC_XDCC
-                    3 -> GlobalSearchEngine.NetworkType.ED2K_KAD
+                val netFilter = when (netSpinner.selectedItemPosition) {
+                    1 -> GlobalSearchEngine.NetworkType.ED2K_KAD
+                    2 -> GlobalSearchEngine.NetworkType.TORRENT
+                    3 -> GlobalSearchEngine.NetworkType.IRC_XDCC
                     else -> GlobalSearchEngine.NetworkType.ALL
                 }
-                performGlobalSearch(query, filter)
+                val catFilter = when (catSpinner.selectedItemPosition) {
+                    1 -> GlobalSearchEngine.FileCategory.VIDEO
+                    2 -> GlobalSearchEngine.FileCategory.AUDIO
+                    3 -> GlobalSearchEngine.FileCategory.ARCHIVE
+                    4 -> GlobalSearchEngine.FileCategory.SOFTWARE_DOC
+                    else -> GlobalSearchEngine.FileCategory.ALL
+                }
+                performGlobalSearch(query, netFilter, catFilter)
             })
 
             searchResultsContainer = LinearLayout(this@MainActivity).apply {
@@ -351,20 +429,24 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun performGlobalSearch(query: String, filter: GlobalSearchEngine.NetworkType) {
+    private fun performGlobalSearch(
+        query: String,
+        netFilter: GlobalSearchEngine.NetworkType,
+        catFilter: GlobalSearchEngine.FileCategory
+    ) {
         searchResultsContainer.removeAllViews()
-        searchResultsContainer.addView(infoLabel("Ricerca in corso per \"$query\"..."))
+        searchResultsContainer.addView(infoLabel("Interrogazione di tutti i server eD2K, nodi KAD, DHT e Bot XDCC per \"$query\"..."))
 
         mainScope.launch {
-            val results = searchEngine.search(query, filter)
+            val results = searchEngine.search(query, netFilter, catFilter)
             searchResultsContainer.removeAllViews()
 
             if (results.isEmpty()) {
-                searchResultsContainer.addView(infoLabel("Nessun risultato trovato per \"$query\"."))
+                searchResultsContainer.addView(infoLabel("Nessun file trovato per \"$query\". Prova con parole chiave più generiche."))
                 return@launch
             }
 
-            searchResultsContainer.addView(infoLabel("Trovati ${results.size} risultati (ordinati per fonti disponibili):"))
+            searchResultsContainer.addView(infoLabel("Trovati ${results.size} file corrispondenti (Formato ed estensione verificati):"))
 
             results.forEach { res ->
                 val card = LinearLayout(this@MainActivity).apply {
@@ -379,76 +461,121 @@ class MainActivity : Activity() {
                     layoutParams = lp
                 }
 
-                val netLabel = when (res.network) {
-                    GlobalSearchEngine.NetworkType.TORRENT -> "BITTORRENT"
-                    GlobalSearchEngine.NetworkType.IRC_XDCC -> "IRC XDCC (${res.ircServer} ${res.ircChannel})"
-                    else -> "ED2K / KAD"
+                val netName = when (res.network) {
+                    GlobalSearchEngine.NetworkType.ED2K_KAD -> "eD2K / KAD"
+                    GlobalSearchEngine.NetworkType.TORRENT -> "BitTorrent"
+                    GlobalSearchEngine.NetworkType.IRC_XDCC -> "IRC XDCC (${res.ircBot})"
+                    else -> "P2P"
                 }
 
+                // Badge Formato (.MKV, .MP4, .AVI, .RAR, .MP3) ben visibile in cima
                 val titleView = TextView(this@MainActivity).apply {
-                    text = res.title
+                    text = "[${res.fileExtension}]  ${res.title}"
                     textSize = 14f
                     setTextColor(Color.WHITE)
                     setTypeface(null, Typeface.BOLD)
                 }
 
-                val metaView = TextView(this@MainActivity).apply {
-                    text = "Rete: $netLabel  |  Dimensione: ${res.sizeText}  |  Fonti: ${res.sources}"
+                val detailsView = TextView(this@MainActivity).apply {
+                    text = "Formato: .${res.fileExtension}  |  Dim: ${res.sizeText}  |  Fonti: ${res.sources} (${res.completeSourcesPercent}% compl.)  |  Rete: $netName"
                     textSize = 12f
                     setTextColor(Color.parseColor("#38BDF8"))
-                    setPadding(0, 6, 0, 12)
+                    setPadding(0, 8, 0, 12)
                 }
 
-                val btnDownload = styledButton("SCARICA E PREPARA ANTEPRIMA", "#16A34A") {
-                    when (res.network) {
-                        GlobalSearchEngine.NetworkType.IRC_XDCC -> {
-                            startIrcAutomatedDownload(res.ircServer, res.ircChannel, res.ircBot, res.ircPack)
-                        }
-                        else -> {
-                            selectScreen(2)
-                            torrentEngine.startStream(res.actionPayload)
-                        }
-                    }
+                val btnRow = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
                 }
+
+                // Bottone per vedere PRIMA di scaricare cosa c'è dentro il file (stile eMule Dettagli/Contenuto)
+                val btnInspect = styledButton("ISPEZIONA CONTENUTO", "#374151") {
+                    showPreDownloadInspectionDialog(res)
+                }.apply {
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                }
+
+                val btnDownload = styledButton("SCARICA FILE", "#16A34A") {
+                    startDownloadFromSearchResult(res)
+                }.apply {
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                }
+
+                btnRow.addView(btnInspect)
+                btnRow.addView(btnDownload)
 
                 card.addView(titleView)
-                card.addView(metaView)
-                card.addView(btnDownload)
+                card.addView(detailsView)
+                card.addView(btnRow)
                 searchResultsContainer.addView(card)
             }
         }
     }
 
+    /**
+     * Mostra una finestra con tutti i dettagli tecnici e il contenuto interno del file PRIMA di scaricarlo
+     */
+    private fun showPreDownloadInspectionDialog(res: GlobalSearchEngine.SearchResult) {
+        AlertDialog.Builder(this)
+            .setTitle("Ispezione File [${res.fileExtension}]")
+            .setMessage(res.inspectionSummary)
+            .setPositiveButton("AVVIA DOWNLOAD") { _, _ ->
+                startDownloadFromSearchResult(res)
+            }
+            .setNegativeButton("Chiudi", null)
+            .show()
+    }
+
+    private fun startDownloadFromSearchResult(res: GlobalSearchEngine.SearchResult) {
+        when (res.network) {
+            GlobalSearchEngine.NetworkType.IRC_XDCC -> {
+                startIrcAutomatedDownload(res.ircServer, res.ircChannel, res.ircBot, res.ircPack)
+            }
+            else -> {
+                // Passa alla nuova scheda TORRENT separata (indice 2)!
+                selectScreen(2)
+                torrentEngine.startStream(res.actionPayload)
+            }
+        }
+    }
+
     // =========================================================================
-    // 3. SCHERMATA FILE & VLC: TRASFERIMENTI, ANTEPRIMA LIBVLC E APERTURA FILE
+    // 3. SCHERMATA TORRENT SEPARATA (Solo Gestione Download Torrent / Magnet / eD2K)
     // =========================================================================
-    private fun buildTransfersScreen(): LinearLayout {
+    private fun buildTorrentScreen(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
 
-            addView(sectionTitle("Aggiungi Download Diretto (Magnet / URL .torrent)"))
+            addView(sectionTitle("Gestione Scaricamenti Torrent / Magnet / eD2K"))
+            addView(infoLabel("Incolla un link Magnet, InfoHash o URL .torrent (supporta compressione GZIP):"))
+
             val directInput = styledEditText("").apply {
-                hint = "magnet:?xt=urn:btih:... oppure URL .torrent"
+                hint = "magnet:?xt=urn:btih:... oppure https://.../file.torrent"
+                minLines = 2
             }
             addView(directInput)
 
-            addView(styledButton("AVVIA SCARICAMENTO", "#0284C7") {
+            addView(styledButton("AVVIA DOWNLOAD TORRENT", "#0284C7") {
                 val input = directInput.text.toString().trim()
                 if (input.isNotEmpty()) {
                     torrentEngine.startStream(input)
                 } else {
-                    Toast.makeText(this@MainActivity, "Inserisci un link valido", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Inserisci un link Magnet o Torrent", Toast.LENGTH_SHORT).show()
                 }
             })
 
-            addView(sectionTitle("Stato Trasferimento Attivo"))
-            transfersStatusText = infoLabel("Nessun trasferimento torrent attivo.")
-            transfersProgressBar = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
+            addView(sectionTitle("Stato Avanzamento Download Attivo"))
+            torrentStatusText = infoLabel("Nessun download torrent attivo al momento.")
+            torrentProgressBar = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
                 max = 100
                 progress = 0
             }
-            addView(transfersStatusText)
-            addView(transfersProgressBar)
+            addView(torrentStatusText)
+            addView(torrentProgressBar)
+
+            currentTorrentFileBtnContainer = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+            addView(currentTorrentFileBtnContainer)
 
             val actionsRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -457,16 +584,59 @@ class MainActivity : Activity() {
                 torrentEngine.stopKeepFiles()
             }.apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) })
 
-            actionsRow.addView(styledButton("ELIMINA CACHE", "#991B1B") {
+            actionsRow.addView(styledButton("FERMA ED ELIMINA FILE", "#991B1B") {
                 torrentEngine.stopAndClearCache()
-                refreshDownloadedAndIncompleteFiles()
+                currentTorrentFileBtnContainer.removeAllViews()
             }.apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) })
             addView(actionsRow)
+        }
+    }
+
+    private fun observeTorrentEngineState() {
+        mainScope.launch {
+            torrentEngine.state.collect { state ->
+                when (state) {
+                    is TorrentStreamState.Idle -> {
+                        torrentStatusText.text = "Stato Torrent: Inattivo"
+                        torrentProgressBar.progress = 0
+                    }
+                    is TorrentStreamState.Buffering -> {
+                        torrentProgressBar.progress = state.progressPercent
+                        torrentStatusText.text = "File: ${state.torrentTitle}\n${state.statusText}  |  Velocità: ${state.downloadSpeedKbps} KB/s  |  Fonti/Peer: ${state.peers}"
+                        P2PEngineService.updateNotificationStatus(
+                            this@MainActivity,
+                            "Download: ${state.progressPercent}% (${state.downloadSpeedKbps} KB/s - ${state.peers} fonti)"
+                        )
+                    }
+                    is TorrentStreamState.Ready -> {
+                        torrentProgressBar.progress = 100
+                        torrentStatusText.text = "Pronto per Anteprima VLC: ${state.videoFile.name}\nSalvato in: ${state.videoFile.absolutePath}"
+                        currentTorrentFileBtnContainer.removeAllViews()
+                        currentTorrentFileBtnContainer.addView(
+                            styledButton("AVVIA ANTEPRIMA LIBVLC ORA", "#16A34A") {
+                                openFullscreenVlcDialog(state.videoFile)
+                            }
+                        )
+                    }
+                    is TorrentStreamState.Error -> {
+                        torrentStatusText.text = "Errore: ${state.message}"
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // 4. SCHERMATA FILE & VLC SEPARATA (Con ANTEPRIMA VLC, APRI FILE ed ELIMINA FILE)
+    // =========================================================================
+    private fun buildFilesVlcScreen(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
 
             addView(sectionTitle("Archivio File Scaricati (Incoming) e Incompleti (Temp / .part)"))
-            addView(infoLabel("Da qui puoi avviare l'anteprima interna con LibVLC (anche per i file incompleti) oppure aprire direttamente il file:"))
+            addView(infoLabel("Gestisci i tuoi file: avvia l'anteprima interna con LibVLC, apri il file o cancellalo dal telefono:"))
 
-            addView(styledButton("AGGIORNA ELENCO FILE", "#2563EB") {
+            addView(styledButton("AGGIORNA LISTA FILE", "#2563EB") {
                 refreshDownloadedAndIncompleteFiles()
             })
 
@@ -492,7 +662,8 @@ class MainActivity : Activity() {
 
         allFiles.forEach { file ->
             val isPart = file.parentFile?.name == "Temp" || file.name.endsWith(".part")
-            val tag = if (isPart) "[INCOMPLETO / TEMP]" else "[COMPLETO / INCOMING]"
+            val statusBadge = if (isPart) "INCOMPLETO (TEMP)" else "COMPLETO (INCOMING)"
+            val ext = file.extension.uppercase().ifBlank { "FILE" }
 
             val rowCard = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -507,14 +678,14 @@ class MainActivity : Activity() {
             }
 
             val nameView = TextView(this).apply {
-                text = file.name
+                text = "[$ext]  ${file.name}"
                 textSize = 14f
                 setTextColor(Color.WHITE)
                 setTypeface(null, Typeface.BOLD)
             }
 
             val infoView = TextView(this).apply {
-                text = "$tag  |  ${file.length() / 1024} KB\n${file.absolutePath}"
+                text = "Stato: $statusBadge  |  Dimensione attuale: ${file.length() / 1024} KB\nPercorso: ${file.absolutePath}"
                 textSize = 11f
                 setTextColor(Color.parseColor("#9CA3AF"))
                 setPadding(0, 6, 0, 12)
@@ -524,7 +695,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
             }
 
-            val btnPreviewVlc = styledButton("ANTEPRIMA LIBVLC", "#0284C7") {
+            val btnPreviewVlc = styledButton("ANTEPRIMA VLC", "#0284C7") {
                 openFullscreenVlcDialog(file)
             }.apply {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -536,8 +707,15 @@ class MainActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
 
+            val btnDeleteFile = styledButton("ELIMINA", "#991B1B") {
+                confirmAndDeleteFile(file)
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
             btnRow.addView(btnPreviewVlc)
             btnRow.addView(btnOpenDirect)
+            btnRow.addView(btnDeleteFile)
 
             rowCard.addView(nameView)
             rowCard.addView(infoView)
@@ -547,12 +725,33 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Apre una finestra Player dedicata a tutto schermo che garantisce l'inizializzazione
-     * della superficie hardware prima di agganciare LibVLC.
+     * Cancella fisicamente il file dal telefono (sia in Temp sia in Incoming) direttamente dall'app
      */
+    private fun confirmAndDeleteFile(file: File) {
+        AlertDialog.Builder(this)
+            .setTitle("Elimina File")
+            .setMessage("Vuoi cancellare definitivamente dal dispositivo il file:\n\n${file.name}?")
+            .setPositiveButton("ELIMINA") { _, _ ->
+                try {
+                    vlcManager.stopAndDetach()
+                    val deleted = file.delete()
+                    if (deleted) {
+                        Toast.makeText(this, "File eliminato: ${file.name}", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "Impossibile eliminare il file.", Toast.LENGTH_SHORT).show()
+                    }
+                    refreshDownloadedAndIncompleteFiles()
+                } catch (e: Exception) {
+                    Toast.makeText(this, "Errore eliminazione: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Annulla", null)
+            .show()
+    }
+
     private fun openFullscreenVlcDialog(file: File) {
         if (!file.exists() || file.length() == 0L) {
-            Toast.makeText(this, "Il file è ancora vuoto (0 byte), attendi qualche secondo.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Il file è ancora a 0 byte, attendi qualche secondo.", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -603,7 +802,7 @@ class MainActivity : Activity() {
         root.addView(videoContainer)
 
         val audioStatus = TextView(this).apply {
-            text = "Inizializzazione LibVLC per: ${file.name} ..."
+            text = "Apertura LibVLC: ${file.name} ..."
             textSize = 12f
             setTextColor(Color.parseColor("#38BDF8"))
             setBackgroundColor(Color.parseColor("#111318"))
@@ -617,7 +816,7 @@ class MainActivity : Activity() {
             setPadding(12, 12, 12, 12)
         }
 
-        bottomControls.addView(styledButton("PLAY / PAUSA", "#2563EB") {
+        bottomControls.addView(styledButton("PLAY/PAUSA", "#2563EB") {
             vlcManager.togglePlayPause()
         }.apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) })
 
@@ -640,12 +839,9 @@ class MainActivity : Activity() {
         root.addView(bottomControls)
 
         dialog.setContentView(root)
-        dialog.setOnDismissListener {
-            vlcManager.stopAndDetach()
-        }
+        dialog.setOnDismissListener { vlcManager.stopAndDetach() }
 
         dialog.setOnShowListener {
-            // Attende che la finestra sia disegnata (dimensioni reali > 0) prima di avviare LibVLC
             vlcLayout.postDelayed({
                 vlcManager.attachAndPrepare(
                     layout = vlcLayout,
@@ -655,7 +851,7 @@ class MainActivity : Activity() {
                     },
                     onError = {
                         runOnUiThread {
-                            audioStatus.text = "Formato non video o header incompleto. Riprova tra qualche secondo."
+                            audioStatus.text = "Il file non è un flusso audio/video o l'header è ancora incompleto."
                         }
                     }
                 )
@@ -665,9 +861,6 @@ class MainActivity : Activity() {
         dialog.show()
     }
 
-    /**
-     * Apre direttamente qualsiasi file scaricato (video, audio, archivio, documento)
-     */
     private fun openFileDirectly(file: File) {
         val ext = file.extension.lowercase()
         val videoExts = setOf("mp4", "mkv", "avi", "ts", "webm", "mov", "m4v", "flv", "mpg", "mpeg", "part")
@@ -684,57 +877,24 @@ class MainActivity : Activity() {
             }
             startActivity(Intent.createChooser(intent, "Apri ${file.name}"))
         } catch (e: Exception) {
-            Toast.makeText(this, "Impossibile aprire il file: ${e.message}", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun observeTorrentEngineState() {
-        mainScope.launch {
-            torrentEngine.state.collect { state ->
-                when (state) {
-                    is TorrentStreamState.Idle -> {
-                        transfersStatusText.text = "Stato Torrent: Inattivo"
-                        transfersProgressBar.progress = 0
-                    }
-                    is TorrentStreamState.Buffering -> {
-                        transfersProgressBar.progress = state.progressPercent
-                        transfersStatusText.text = "${state.torrentTitle}\n${state.statusText}  |  ${state.downloadSpeedKbps} KB/s  |  Peer: ${state.peers}"
-                        P2PEngineService.updateNotificationStatus(
-                            this@MainActivity,
-                            "Download: ${state.progressPercent}% (${state.downloadSpeedKbps} KB/s)"
-                        )
-                    }
-                    is TorrentStreamState.Ready -> {
-                        transfersProgressBar.progress = 100
-                        transfersStatusText.text = "Pronto per la riproduzione: ${state.videoFile.name}"
-                        refreshDownloadedAndIncompleteFiles()
-                        openFullscreenVlcDialog(state.videoFile)
-                    }
-                    is TorrentStreamState.Error -> {
-                        transfersStatusText.text = "Errore: ${state.message}"
-                    }
-                }
-            }
+            Toast.makeText(this, "Nessuna app esterna trovata per aprire .$ext", Toast.LENGTH_SHORT).show()
         }
     }
 
     // =========================================================================
-    // 4. SCHERMATA mIRC: COMANDI /LIST, SCANSIONE CANALI E XDCC
+    // 5. SCHERMATA mIRC: COMANDI /LIST, SCANSIONE CANALI E XDCC
     // =========================================================================
     private fun buildIrcScreen(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
 
             addView(sectionTitle("Client mIRC & Scanner Canali (/list)"))
-            addView(infoLabel("Scegli un server IRC predefinito oppure scrivi qualsiasi indirizzo server:"))
-
             val presetServers = listOf(
                 "Seleziona Server IRC rapido...",
                 "irc.rizon.net",
                 "irc.ircgate.it",
                 "irc.quartznet.org",
                 "irc.chlame.net",
-                "irc.freenode.net",
                 "irc.libera.chat",
                 "irc.abjects.net"
             )
@@ -744,18 +904,14 @@ class MainActivity : Activity() {
                 setBackgroundColor(Color.parseColor("#262B36"))
                 onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
                     override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
-                        if (position > 0) {
-                            ircServerInput.setText(presetServers[position])
-                        }
+                        if (position > 0) ircServerInput.setText(presetServers[position])
                     }
                     override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
                 }
             }
             addView(serverSpinner)
 
-            ircServerInput = styledEditText("irc.rizon.net").apply {
-                hint = "Indirizzo Server IRC"
-            }
+            ircServerInput = styledEditText("irc.rizon.net")
             ircChannelInput = styledEditText("").apply {
                 hint = "Canale automatico opzionale (es. #canale)"
             }
@@ -765,43 +921,44 @@ class MainActivity : Activity() {
             val connRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
             }
-            connRow.addView(styledButton("CONNETTI SERVER", "#0284C7") {
+            connRow.addView(styledButton("CONNETTI IRC", "#0284C7") {
                 connectToIrcServer(
                     ircServerInput.text.toString().trim(),
                     ircChannelInput.text.toString().trim()
                 )
             }.apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) })
 
-            connRow.addView(styledButton("SCANSIONA CANALI (/LIST)", "#2563EB") {
+            connRow.addView(styledButton("SCANSIONA (/LIST)", "#2563EB") {
                 if (ircEngine == null) {
-                    Toast.makeText(this@MainActivity, "Connettiti prima a un server IRC!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Connettiti prima al server IRC", Toast.LENGTH_SHORT).show()
                 } else {
                     scannedChannels.clear()
                     ircEngine?.requestChannelList()
                 }
             }.apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) })
+
+            connRow.addView(styledButton("DISCONNETTI", "#991B1B") {
+                ircEngine?.disconnect()
+                ircEngine = null
+            }.apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) })
             addView(connRow)
 
-            addView(styledButton("APRI LISTA CANALI TROVATI CON /LIST", "#374151") {
+            addView(styledButton("MOSTRA CANALI TROVATI CON /LIST", "#374151") {
                 showScannedChannelsDialog()
             })
 
-            // --- BARRA COMANDI mIRC (/list, /join, /msg, /nick, /whois) ---
-            addView(sectionTitle("Barra Comandi mIRC"))
-            addView(infoLabel("Comandi supportati: /list, /join #canale, /part, /msg NomeBot xdcc send #1, /nick NuovoNick, /whois"))
+            addView(sectionTitle("Riga di Comando mIRC"))
+            addView(infoLabel("Comandi: /list, /join #canale, /part, /msg NomeBot xdcc send #1, /nick NuovoNick"))
 
             val cmdRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
             }
             ircCommandInput = styledEditText("/list").apply {
-                hint = "Scrivi comando (es. /list o /join #canale)"
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
             val btnSendCmd = styledButton("INVIA", "#16A34A") {
                 val cmd = ircCommandInput.text.toString().trim()
-                if (cmd.equals("/list", ignoreCase = true)) {
-                    scannedChannels.clear()
-                }
+                if (cmd.equals("/list", ignoreCase = true)) scannedChannels.clear()
                 ircEngine?.executeMircCommand(cmd)
                 ircCommandInput.setText("")
             }
@@ -809,8 +966,7 @@ class MainActivity : Activity() {
             cmdRow.addView(btnSendCmd)
             addView(cmdRow)
 
-            // --- STATO SCARICAMENTO XDCC + PULSANTE ANTEPRIMA LIVE ---
-            ircProgressLabel = infoLabel("Nessun download XDCC attivo")
+            ircProgressLabel = infoLabel("Nessun download XDCC in corso")
             ircProgressBar = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
                 max = 100
                 progress = 0
@@ -819,8 +975,8 @@ class MainActivity : Activity() {
             addView(ircProgressBar)
 
             ircLogText = TextView(this@MainActivity).apply {
-                text = "Console mIRC pronta. Connettiti a un server e usa /list per esplorare tutti i canali."
-                textSize = 12f
+                text = "Terminale mIRC pronto."
+                textSize = 11f
                 typeface = Typeface.MONOSPACE
                 setBackgroundColor(Color.parseColor("#0B0E14"))
                 setTextColor(Color.parseColor("#4ADE80"))
@@ -854,38 +1010,35 @@ class MainActivity : Activity() {
                     is IrcXdccEngine.Event.Log -> appendIrcLog(event.text)
                     is IrcXdccEngine.Event.Connected -> {
                         appendIrcLog("Connesso a ${event.server}")
-                        topStatusBanner.text = "UltimateMule  |  IRC: Online (${event.server})"
-                        P2PEngineService.updateNotificationStatus(this@MainActivity, "IRC Connesso: ${event.server}")
+                        topStatusBanner.text = "UltimateMule  |  IRC Online: ${event.server}"
                         onConnectedAction?.invoke()
                     }
                     is IrcXdccEngine.Event.ChannelMessage ->
                         appendIrcLog("[${event.target}] <${event.from}> ${event.text}")
                     is IrcXdccEngine.Event.ChannelListStart -> {
                         scannedChannels.clear()
-                        appendIrcLog("Ricezione lista canali da ${event.server}...")
+                        appendIrcLog("Scansione /list avviata su ${event.server}...")
                     }
                     is IrcXdccEngine.Event.ChannelListItem -> {
-                        if (scannedChannels.size < 500) {
-                            scannedChannels.add(event.info)
-                        }
+                        if (scannedChannels.size < 600) scannedChannels.add(event.info)
                     }
                     is IrcXdccEngine.Event.ChannelListEnd -> {
                         scannedChannels.sortByDescending { it.usersCount }
-                        appendIrcLog("Scansione /list completata (${scannedChannels.size} canali). Premi 'APRI LISTA CANALI'.")
+                        appendIrcLog("Fine /list: ${scannedChannels.size} canali trovati.")
                         showScannedChannelsDialog()
                     }
                     is IrcXdccEngine.Event.DccOfferReceived ->
-                        appendIrcLog("Ricevuto DCC SEND: ${event.offer.filename} (${event.offer.size / 1024} KB)")
+                        appendIrcLog("Ricevuto DCC: ${event.offer.filename} (${event.offer.size / 1024} KB)")
                     is IrcXdccEngine.Event.DownloadProgress -> {
                         val pct = if (event.total > 0) ((event.received * 100) / event.total).toInt() else 0
                         ircProgressBar.progress = pct
                         val speedKb = event.speedBps / 1024
-                        ircProgressLabel.text = "Scaricamento: ${event.filename} - $pct% ($speedKb KB/s)"
+                        ircProgressLabel.text = "XDCC: ${event.filename} - $pct% ($speedKb KB/s)"
                     }
                     is IrcXdccEngine.Event.DownloadComplete -> {
                         ircProgressBar.progress = 100
-                        ircProgressLabel.text = "Completato: ${event.file.name}"
-                        appendIrcLog("File completato in Incoming: ${event.file.name}")
+                        ircProgressLabel.text = "Completato in Incoming: ${event.file.name}"
+                        appendIrcLog("Download completato: ${event.file.name}")
                     }
                     is IrcXdccEngine.Event.DownloadFailed ->
                         appendIrcLog("Errore DCC: ${event.reason}")
@@ -899,13 +1052,13 @@ class MainActivity : Activity() {
 
     private fun showScannedChannelsDialog() {
         if (scannedChannels.isEmpty()) {
-            Toast.makeText(this, "Nessun canale in lista. Connettiti e premi 'SCANSIONA CANALI (/LIST)'.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Nessun canale in memoria. Premi 'SCANSIONA (/LIST)'.", Toast.LENGTH_LONG).show()
             return
         }
 
-        val items = scannedChannels.map { "${it.channel} (${it.usersCount} utenti) - ${it.topic.take(60)}" }.toTypedArray()
+        val items = scannedChannels.map { "${it.channel} (${it.usersCount} ut.) - ${it.topic.take(55)}" }.toTypedArray()
         AlertDialog.Builder(this)
-            .setTitle("Canali trovati sul Server (${scannedChannels.size}) - Tocca per entrare")
+            .setTitle("Canali del Server (${scannedChannels.size}) - Tocca per entrare")
             .setItems(items) { _, which ->
                 val chosen = scannedChannels[which].channel
                 ircChannelInput.setText(chosen)
@@ -916,7 +1069,7 @@ class MainActivity : Activity() {
     }
 
     private fun startIrcAutomatedDownload(server: String, channel: String, bot: String, pack: Int) {
-        selectScreen(3)
+        selectScreen(4) // Va alla scheda mIRC
         ircServerInput.setText(server)
         ircChannelInput.setText(channel)
         connectToIrcServer(server, channel) {
@@ -933,7 +1086,7 @@ class MainActivity : Activity() {
     }
 
     // =========================================================================
-    // 5. SCHERMATA OPZIONI: PERMESSI ANDROID 16, CARTELLE E PORTE EMULE
+    // 6. SCHERMATA OPZIONI: CONFIGURAZIONE AVANZATA EMULE & PERMESSI ANDROID 16
     // =========================================================================
     private fun buildSettingsScreen(): LinearLayout {
         val prefs = getSharedPreferences("UltimateMulePrefs", Context.MODE_PRIVATE)
@@ -943,21 +1096,12 @@ class MainActivity : Activity() {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
 
-            addView(sectionTitle("Permessi di Sistema (Android ${Build.VERSION.RELEASE})"))
+            addView(sectionTitle("Permessi Sistema Android ${Build.VERSION.RELEASE}"))
+            addView(styledButton("ATTIVA NOTIFICHE IN BACKGROUND", "#0284C7") { openOrRequestNotifications() })
+            addView(styledButton("1. SBLOCCA ACCESSO TOTALE MEMORIA", "#2563EB") { requestAllFilesAccess() })
+            addView(styledButton("2. DISATTIVA OTTIMIZZAZIONE BATTERIA", "#2563EB") { disableBatteryOptimization() })
 
-            addView(styledButton("ATTIVA NOTIFICHE IN BACKGROUND", "#0284C7") {
-                openOrRequestNotifications()
-            })
-
-            addView(styledButton("1. SBLOCCA ACCESSO TOTALE MEMORIA", "#2563EB") {
-                requestAllFilesAccess()
-            })
-
-            addView(styledButton("2. DISATTIVA OTTIMIZZAZIONE BATTERIA", "#2563EB") {
-                disableBatteryOptimization()
-            })
-
-            addView(sectionTitle("Cartella Principale di Salvataggio"))
+            addView(sectionTitle("Cartella di Salvataggio Assegnata"))
             folderInput = styledEditText(savedPath)
             addView(folderInput)
 
@@ -967,12 +1111,14 @@ class MainActivity : Activity() {
                 verifyAndCreateFolders(chosen)
             })
 
-            addView(sectionTitle("Parametri Rete eMule (Porte TCP / UDP / Compressione)"))
+            addView(sectionTitle("Configurazione Avanzata eMule (Porte, Fonti Massime, Connessioni)"))
             val tcpPortInput = styledEditText(prefs.getString("emule_tcp", "4662") ?: "4662")
             val udpPortInput = styledEditText(prefs.getString("emule_udp", "4672") ?: "4672")
+            val maxSourcesInput = styledEditText(prefs.getString("emule_max_sources", "1500") ?: "1500")
+            val maxConnInput = styledEditText(prefs.getString("emule_max_conn", "500") ?: "500")
 
             val chkObfuscation = CheckBox(this@MainActivity).apply {
-                text = "Abilita Offuscamento Protocollo"
+                text = "Abilita Offuscamento Protocollo (Anti-Filtro Operatori)"
                 isChecked = prefs.getBoolean("emule_obfuscation", true)
                 setTextColor(Color.WHITE)
             }
@@ -981,28 +1127,41 @@ class MainActivity : Activity() {
                 isChecked = prefs.getBoolean("emule_gzip", true)
                 setTextColor(Color.WHITE)
             }
+            val chkFirstLastChunk = CheckBox(this@MainActivity).apply {
+                text = "Scarica prima il primo e l'ultimo pezzo per l'anteprima VLC"
+                isChecked = prefs.getBoolean("emule_preview_chunks", true)
+                setTextColor(Color.WHITE)
+            }
 
-            addView(infoLabel("Porta TCP Client:"))
+            addView(infoLabel("Porta TCP Client (ID Alto):"))
             addView(tcpPortInput)
             addView(infoLabel("Porta UDP KAD:"))
             addView(udpPortInput)
+            addView(infoLabel("Fonti Massime per File (Hard Limit):"))
+            addView(maxSourcesInput)
+            addView(infoLabel("Connessioni Massime simultanee:"))
+            addView(maxConnInput)
             addView(chkObfuscation)
             addView(chkGzip)
+            addView(chkFirstLastChunk)
 
-            addView(styledButton("SALVA IMPOSTAZIONI EMULE", "#16A34A") {
+            addView(styledButton("SALVA TUTTE LE IMPOSTAZIONI EMULE", "#16A34A") {
                 prefs.edit()
                     .putString("emule_tcp", tcpPortInput.text.toString())
                     .putString("emule_udp", udpPortInput.text.toString())
+                    .putString("emule_max_sources", maxSourcesInput.text.toString())
+                    .putString("emule_max_conn", maxConnInput.text.toString())
                     .putBoolean("emule_obfuscation", chkObfuscation.isChecked)
                     .putBoolean("emule_gzip", chkGzip.isChecked)
+                    .putBoolean("emule_preview_chunks", chkFirstLastChunk.isChecked)
                     .apply()
-                Toast.makeText(this@MainActivity, "Configurazione salvata.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Impostazioni avanzate eMule salvate.", Toast.LENGTH_SHORT).show()
             })
         }
     }
 
     // =========================================================================
-    // COMPONENTI UI & UTILITÀ
+    // UTILITÀ UI & SISTEMA
     // =========================================================================
     private fun styledEditText(initial: String): EditText {
         return EditText(this).apply {
@@ -1010,7 +1169,7 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             setHintTextColor(Color.parseColor("#6B7280"))
             setBackgroundColor(Color.parseColor("#1E2430"))
-            setPadding(24, 20, 24, 20)
+            setPadding(24, 18, 24, 18)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -1023,10 +1182,10 @@ class MainActivity : Activity() {
     private fun styledButton(label: String, hexColor: String, onClick: () -> Unit): Button {
         return Button(this).apply {
             text = label
-            textSize = 12f
+            textSize = 11f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor(hexColor))
-            setPadding(20, 18, 20, 18)
+            setPadding(16, 16, 16, 16)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -1043,7 +1202,7 @@ class MainActivity : Activity() {
             textSize = 15f
             setTextColor(Color.parseColor("#38BDF8"))
             setTypeface(null, Typeface.BOLD)
-            setPadding(0, 24, 0, 8)
+            setPadding(0, 22, 0, 8)
         }
     }
 
@@ -1127,4 +1286,3 @@ class MainActivity : Activity() {
         vlcManager.release()
     }
 }
-       
