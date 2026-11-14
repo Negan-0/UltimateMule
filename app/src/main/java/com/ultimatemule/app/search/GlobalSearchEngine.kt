@@ -12,16 +12,16 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.net.URLDecoder
 import java.net.URLEncoder
-import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
 
 /**
- * Motore di Ricerca Multi-Provider:
- * - IRC XDCC: Cerca nei file caricati dal Canale IRC attivo + XDCC.eu + SunXDCC
- * - BitTorrent: Cerca su Il Corsaro Nero (ITA), BitSearch, 1337x/TorrentCsv, ApiBay, YTS
- * - eD2K / KAD: Cerca via UDP sui Server eD2K + Gateway Globale KAD/DHT
+ * Motore di Ricerca Globale Unificato con 3 Motori Rigorosamente Separati:
+ * 1) ED2K_KAD -> Restituisce esclusivamente link ed2k://|file|... per il motore eMule
+ * 2) TORRENT  -> Restituisce esclusivamente link magnet:? / .torrent (inclusi siti personalizzati)
+ * 3) IRC_XDCC -> Restituisce esclusivamente pacchetti Bot XDCC per il motore mIRC
  */
 class GlobalSearchEngine(private val configDir: File) {
 
@@ -31,6 +31,10 @@ class GlobalSearchEngine(private val configDir: File) {
 
     enum class FileCategory {
         ALL, VIDEO, AUDIO, ARCHIVE, SOFTWARE_DOC
+    }
+
+    enum class LanguagePreference {
+        ANY, ITALIAN_PRIORITY, ITALIAN_STRICT, ENGLISH
     }
 
     data class SearchResult(
@@ -52,6 +56,14 @@ class GlobalSearchEngine(private val configDir: File) {
         val ircPack: Int = 0
     )
 
+    companion object {
+        const val DEFAULT_CUSTOM_TORRENT_SITES =
+            "https://ilcorsaronero.link/search?q={query}\n" +
+            "https://knaben.eu/search/?q={query}\n" +
+            "https://bitsearch.to/search?q={query}\n" +
+            "https://therarbg.to/get-posts/keywords:{query}/"
+    }
+
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -59,29 +71,60 @@ class GlobalSearchEngine(private val configDir: File) {
         .followSslRedirects(true)
         .build()
 
-    private fun buildSmartQueryVariants(rawQuery: String): List<String> {
+    /**
+     * Costruisce le varianti intelligenti della query SENZA MAI CANCELLARE "ITA":
+     * Es: "the Boys s01 e 3 ita" ->
+     * 1) "the Boys S01E03 ita"
+     * 2) "the Boys 1x03 ita"
+     * 3) "the Boys s01 e 3 ita"
+     * 4) "the Boys S01E03 italian"
+     */
+    private fun buildSmartQueryVariants(
+        rawQuery: String,
+        langPref: LanguagePreference
+    ): List<String> {
         val variants = linkedSetOf<String>()
-        val clean = rawQuery.trim().replace(Regex("\\s+"), " ")
-        variants.add(clean)
+        var clean = rawQuery.trim().replace(Regex("\\s+"), " ")
 
-        val words = clean.split(" ")
-        val hasIta = words.any { it.equals("ita", ignoreCase = true) || it.equals("italiano", ignoreCase = true) }
+        // Se l'utente ha impostato Italiano Prioritario/Obbligatorio e non ha scritto "ita", lo aggiunge come variante primaria
+        val userWroteIta = Regex("\\b(ita|italiano|italian|sub[.\\s_-]*ita)\\b", RegexOption.IGNORE_CASE)
+            .containsMatchIn(clean)
 
-        if (hasIta) {
-            val withItalian = words.joinToString(" ") {
-                if (it.equals("ita", ignoreCase = true) || it.equals("italiano", ignoreCase = true)) "italian" else it
-            }
-            variants.add(withItalian)
+        if (!userWroteIta && (langPref == LanguagePreference.ITALIAN_PRIORITY || langPref == LanguagePreference.ITALIAN_STRICT)) {
+            clean = "$clean ita"
+        } else if (!userWroteIta && langPref == LanguagePreference.ENGLISH) {
+            clean = "$clean eng"
         }
 
-        val baseWithoutLang = words.filterNot {
-            it.equals("ita", ignoreCase = true) ||
-            it.equals("italiano", ignoreCase = true) ||
-            it.equals("italian", ignoreCase = true)
-        }.joinToString(" ").trim()
+        // Normalizza pattern serie TV: "s01 e 3", "s1 e03", "s01ep03", "stagione 1 episodio 3" -> "S01E03" e "1x03"
+        val epRegex = Regex("""\bs(?:tagione)?\s*0*(\d{1,2})\s*[-._\s]*e(?:p|pisodio)?\s*0*(\d{1,3})\b""", RegexOption.IGNORE_CASE)
+        val epMatch = epRegex.find(clean)
 
-        if (baseWithoutLang.length >= 2) {
-            variants.add(baseWithoutLang)
+        if (epMatch != null) {
+            val seasonNum = epMatch.groupValues[1].toIntOrNull() ?: 1
+            val epNum = epMatch.groupValues[2].toIntOrNull() ?: 1
+            val s00e00 = String.format("S%02dE%02d", seasonNum, epNum)
+            val sXe00 = String.format("%dx%02d", seasonNum, epNum)
+
+            val normalizedS00E00 = clean.replace(epRegex, s00e00)
+            val normalized1x00 = clean.replace(epRegex, sXe00)
+
+            variants.add(normalizedS00E00)
+            variants.add(normalized1x00)
+
+            if (userWroteIta || langPref == LanguagePreference.ITALIAN_PRIORITY || langPref == LanguagePreference.ITALIAN_STRICT) {
+                variants.add(
+                    normalizedS00E00.replace(Regex("\\b(ita|italiano)\\b", RegexOption.IGNORE_CASE), "ITALIAN")
+                )
+            }
+        }
+
+        variants.add(clean)
+
+        // Aggiunge variante con "italian" invece di "ita" (senza mai rimuovere il filtro lingua!)
+        if (userWroteIta) {
+            val withItalian = clean.replace(Regex("\\b(ita|italiano)\\b", RegexOption.IGNORE_CASE), "italian")
+            variants.add(withItalian)
         }
 
         return variants.toList()
@@ -90,24 +133,30 @@ class GlobalSearchEngine(private val configDir: File) {
     suspend fun search(
         query: String,
         netFilter: NetworkType,
-        catFilter: FileCategory = FileCategory.ALL
+        catFilter: FileCategory = FileCategory.ALL,
+        langPref: LanguagePreference = LanguagePreference.ANY,
+        customTorrentSiteTemplates: List<String> = emptyList()
     ): List<SearchResult> = withContext(Dispatchers.IO) {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return@withContext emptyList()
 
-        val queryVariants = buildSmartQueryVariants(cleanQuery)
+        val userExplicitlyWroteIta = Regex("\\b(ita|italiano|italian)\\b", RegexOption.IGNORE_CASE)
+            .containsMatchIn(cleanQuery)
+        val requireItalianMatch = userExplicitlyWroteIta || langPref == LanguagePreference.ITALIAN_STRICT
+
+        val queryVariants = buildSmartQueryVariants(cleanQuery, langPref)
         val deduplicatedMap = linkedMapOf<String, SearchResult>()
 
         coroutineScope {
             val ed2kJob = async {
                 if (netFilter == NetworkType.ALL || netFilter == NetworkType.ED2K_KAD) {
-                    searchEd2kAndKadMultiServer(queryVariants)
+                    searchEd2kAndKadNativeOnly(queryVariants)
                 } else emptyList()
             }
 
             val torrentJob = async {
                 if (netFilter == NetworkType.ALL || netFilter == NetworkType.TORRENT) {
-                    searchAllTorrentSites(queryVariants)
+                    searchAllTorrentSites(queryVariants, customTorrentSiteTemplates)
                 } else emptyList()
             }
 
@@ -117,15 +166,27 @@ class GlobalSearchEngine(private val configDir: File) {
                 } else emptyList()
             }
 
-            (ircJob.await() + ed2kJob.await() + torrentJob.await()).forEach { item ->
-                val key = "${item.network}_${item.title.lowercase()}_${item.sizeText}"
+            (ed2kJob.await() + torrentJob.await() + ircJob.await()).forEach { item ->
+                val key = "${item.network}_${item.fileHash.ifBlank { item.title.lowercase() }}"
                 if (!deduplicatedMap.containsKey(key)) {
                     deduplicatedMap[key] = item
                 }
             }
         }
 
-        val allResults = deduplicatedMap.values.toList()
+        var allResults = deduplicatedMap.values.toList()
+
+        // Se l'utente ha scritto "ita" nella barra di ricerca o ha impostato "Solo Italiano",
+        // scarta i risultati stranieri che non contengono ITA/ITALIAN/MULTI/SUB-ITA
+        if (requireItalianMatch) {
+            val itaRegex = Regex("\\b(ita|italiano|italian|multi|dual|sub[.\\s_-]*ita|iTALiAN)\\b", RegexOption.IGNORE_CASE)
+            val onlyItalian = allResults.filter { res ->
+                itaRegex.containsMatchIn(res.title) || res.providerName.contains("ITA", ignoreCase = true)
+            }
+            if (onlyItalian.isNotEmpty()) {
+                allResults = onlyItalian
+            }
+        }
 
         val filtered = if (catFilter == FileCategory.ALL) {
             allResults
@@ -134,11 +195,21 @@ class GlobalSearchEngine(private val configDir: File) {
             strictCat.ifEmpty { allResults }
         }
 
-        val queryTokens = cleanQuery.lowercase().split(" ").filter { it.length > 1 }
+        // Token di rilevanza (inclusi S01E03 / 1x03 / ITA)
+        val allTokens = queryVariants.first().lowercase()
+            .replace('.', ' ')
+            .replace('_', ' ')
+            .split(" ")
+            .filter { it.length >= 2 }
+
         filtered.sortedWith(
             compareByDescending<SearchResult> { res ->
-                val lower = res.title.lowercase()
-                queryTokens.count { token -> lower.contains(token) }
+                val normalizedTitle = res.title.lowercase().replace('.', ' ').replace('_', ' ')
+                var score = allTokens.count { token -> normalizedTitle.contains(token) } * 10
+                if (Regex("\\b(ita|italiano|italian)\\b", RegexOption.IGNORE_CASE).containsMatchIn(res.title)) {
+                    score += if (requireItalianMatch || langPref == LanguagePreference.ITALIAN_PRIORITY) 25 else 5
+                }
+                score
             }.thenByDescending { it.sources }
         )
     }
@@ -148,13 +219,13 @@ class GlobalSearchEngine(private val configDir: File) {
     // =========================================================================
     private suspend fun searchAllIrcSources(rawQuery: String, variants: List<String>): List<SearchResult> = coroutineScope {
         val list = mutableListOf<SearchResult>()
-        val tokens = rawQuery.lowercase().split(" ").filter { it.isNotBlank() }
+        val tokens = variants.first().lowercase().split(" ").filter { it.length >= 2 }
 
-        // A) Cerca prima tra tutti i file catturati dal Canale IRC in cui l'utente è entrato!
+        // A) File annunciati nei Canali IRC attivi
         val snapshot = IrcXdccEngine.sharedChannelPacks.values.toList()
         snapshot.forEach { pack ->
-            val lowerName = pack.filename.lowercase()
-            if (tokens.any { lowerName.contains(it) }) {
+            val lowerName = pack.filename.lowercase().replace('.', ' ').replace('_', ' ')
+            if (tokens.all { lowerName.contains(it) } || tokens.count { lowerName.contains(it) } >= maxOf(1, tokens.size - 1)) {
                 val ext = extractExtension(pack.filename, 200)
                 list.add(
                     SearchResult(
@@ -166,10 +237,11 @@ class GlobalSearchEngine(private val configDir: File) {
                         sources = 150,
                         completeSourcesPercent = 100,
                         network = NetworkType.IRC_XDCC,
-                        providerName = "Canale IRC ${pack.channel}",
+                        providerName = "Canale mIRC ${pack.channel}",
                         actionPayload = "${pack.server}|${pack.channel}|${pack.botNick}|${pack.packNumber}",
                         fileHash = "BOT:${pack.botNick}#${pack.packNumber}",
                         inspectionSummary = "File presente nel Canale IRC ${pack.channel}\n" +
+                                "• Motore: mIRC XDCC Nativo\n" +
                                 "• Bot: ${pack.botNick} (Pacchetto #${pack.packNumber})\n" +
                                 "• Server: ${pack.server}\n" +
                                 "• Dimensione: ${pack.sizeText}",
@@ -182,14 +254,13 @@ class GlobalSearchEngine(private val configDir: File) {
             }
         }
 
-        // B) Motore Globale XDCC.eu (Scansiona Rizon, Abjects, IrcGate, QuartzNet, Criten, ecc.)
+        // B) XDCC.eu
         val xdccEuJob = async {
             val euList = mutableListOf<SearchResult>()
             for (q in variants.take(2)) {
                 try {
                     val encoded = URLEncoder.encode(q, "UTF-8")
                     val html = fetchStringGzip("https://www.xdcc.eu/search.php?searchkey=$encoded")
-                    // Estrae le righe della tabella di xdcc.eu
                     val rowRegex = Regex("""<tr[^>]*>\s*<td[^>]*>([^<]+)</td>\s*<td[^>]*>(#[^<]+)</td>\s*<td[^>]*>([^<]+)</td>\s*<td[^>]*>#?(\d+)</td>\s*<td[^>]*>[^<]*</td>\s*<td[^>]*>([^<]+)</td>\s*<td[^>]*>([^<]+)</td>""", RegexOption.IGNORE_CASE)
                     rowRegex.findAll(html).take(35).forEach { m ->
                         val netName = m.groupValues[1].trim()
@@ -211,7 +282,7 @@ class GlobalSearchEngine(private val configDir: File) {
                                     sources = 120,
                                     completeSourcesPercent = 100,
                                     network = NetworkType.IRC_XDCC,
-                                    providerName = "XDCC.eu ($serverHost)",
+                                    providerName = "mIRC XDCC ($serverHost)",
                                     actionPayload = "$serverHost|$chan|$bot|$pack",
                                     fileHash = "XDCC:$bot#$pack",
                                     inspectionSummary = "Pacchetto IRC XDCC verificato\n• Server: $serverHost\n• Canale: $chan\n• Bot: $bot (#$pack)\n• File: $fname ($sizeStr)",
@@ -228,7 +299,7 @@ class GlobalSearchEngine(private val configDir: File) {
             euList
         }
 
-        // C) Motore Globale SunXDCC JSON
+        // C) SunXDCC JSON
         val sunXdccJob = async {
             val sunList = mutableListOf<SearchResult>()
             for (q in variants.take(2)) {
@@ -266,7 +337,7 @@ class GlobalSearchEngine(private val configDir: File) {
                                             sources = 100,
                                             completeSourcesPercent = 100,
                                             network = NetworkType.IRC_XDCC,
-                                            providerName = "IRC ($net $chan)",
+                                            providerName = "mIRC ($net $chan)",
                                             actionPayload = "$net|$chan|$bot|$pack",
                                             fileHash = "BOT:$bot#$pack",
                                             inspectionSummary = "Pacchetto Bot XDCC\n• File: $fname\n• Server: $net ($chan)\n• Comando: /msg $bot xdcc send #$pack",
@@ -301,97 +372,91 @@ class GlobalSearchEngine(private val configDir: File) {
             l.contains("dal") -> "irc.dal.net"
             l.contains("efnet") -> "irc.efnet.org"
             l.contains("quakenet") -> "irc.quakenet.org"
+            l.contains("ircgate") -> "irc.ircgate.it"
+            l.contains("quartz") -> "irc.quartznet.org"
+            l.contains("ocean") -> "irc.oceanirc.net"
             l.contains(".") -> net.trim()
             else -> "irc.rizon.net"
         }
     }
 
     // =========================================================================
-    // 2. RICERCA MULTI-SITO BITTORRENT (IL CORSARO NERO, BITSEARCH, 1337X/CSV, APIBAY)
+    // 2. RICERCA BITTORRENT (SITI PERSONALIZZABILI DALL'UTENTE + TRACKER DHT)
     // =========================================================================
-    private suspend fun searchAllTorrentSites(variants: List<String>): List<SearchResult> = coroutineScope {
+    private suspend fun searchAllTorrentSites(
+        variants: List<String>,
+        customSiteTemplates: List<String>
+    ): List<SearchResult> = coroutineScope {
         val list = mutableListOf<SearchResult>()
 
-        // A) BitSearch.to (Aggregatore Globale che indicizza 1337x, Il Corsaro Nero, Rarbg, Nyaa, DHT)
-        val bitSearchJob = async {
+        val activeTemplates = if (customSiteTemplates.isNotEmpty()) {
+            customSiteTemplates
+        } else {
+            DEFAULT_CUSTOM_TORRENT_SITES.split("\n")
+        }.map { it.trim() }.filter { it.startsWith("http") }
+
+        // A) Scraper Universale GZIP per tutti i siti Torrent inseriti manualmente dall'utente
+        val customSitesJob = async {
             val sub = mutableListOf<SearchResult>()
-            for (q in variants.take(2)) {
-                try {
-                    val encoded = URLEncoder.encode(q, "UTF-8")
-                    val html = fetchStringGzip("https://bitsearch.to/search?q=$encoded")
-                    val cardBlocks = html.split("search-result")
-                    for (block in cardBlocks.drop(1).take(35)) {
-                        val magnetMatch = Regex("""href="(magnet:\?xt=urn:btih:[^"]+)"""").find(block)
-                        val titleMatch = Regex("""<h5[^>]*>.*?<a[^>]*>([^<]+)</a>""", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)).find(block)
-                        val sizeMatch = Regex("""([0-9.,]+\s*(?:GB|MB|KB))""", RegexOption.IGNORE_CASE).find(block)
+            for (template in activeTemplates) {
+                val siteDomain = try {
+                    template.substringAfter("://").substringBefore("/")
+                } catch (_: Exception) {
+                    "Sito Torrent"
+                }
 
-                        val magnet = magnetMatch?.groupValues?.get(1)?.replace("&amp;", "&") ?: continue
-                        val rawTitle = titleMatch?.groupValues?.get(1)?.trim() ?: extractNameFromMagnet(magnet)
-                        val sizeStr = sizeMatch?.groupValues?.get(1) ?: "Variabile"
+                for (q in variants.take(2)) {
+                    try {
+                        val encoded = URLEncoder.encode(q, "UTF-8")
+                        val targetUrl = if (template.contains("{query}")) {
+                            template.replace("{query}", encoded)
+                        } else if (template.contains("?")) {
+                            "$template$encoded"
+                        } else {
+                            "${template.trimEnd('/')}/search?q=$encoded"
+                        }
 
-                        if (rawTitle.isNotBlank()) {
+                        val html = fetchStringGzip(targetUrl)
+                        if (html.isBlank()) continue
+
+                        // Estrae tutti i link magnet presenti nella pagina del sito Torrent
+                        val magnetRegex = Regex("""(magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}[^"'\s<>]*)""", RegexOption.IGNORE_CASE)
+                        magnetRegex.findAll(html).take(35).forEach { m ->
+                            val magnet = m.groupValues[1].replace("&amp;", "&")
+                            val infoHash = magnet.substringAfter("btih:").substringBefore("&").uppercase()
+                            val rawTitle = extractNameFromMagnet(magnet).ifBlank { q }
                             val ext = extractExtension(rawTitle, 200)
                             val fullTitle = ensureExtensionInName(rawTitle, ext)
+
                             sub.add(
                                 SearchResult(
                                     title = fullTitle,
                                     fileExtension = ext,
                                     category = categorizeByExtension(ext),
-                                    sizeText = sizeStr,
+                                    sizeText = "Torrent ($siteDomain)",
                                     sizeBytes = 0L,
-                                    sources = 45,
+                                    sources = 50,
                                     completeSourcesPercent = 100,
                                     network = NetworkType.TORRENT,
-                                    providerName = "1337x / BitSearch DHT",
+                                    providerName = "Torrent ($siteDomain)",
                                     actionPayload = magnet,
-                                    fileHash = magnet.substringAfter("btih:").substringBefore("&"),
-                                    inspectionSummary = buildPreDownloadInspection(fullTitle, ext, 0L, magnet.substringAfter("btih:").substringBefore("&"), 45, "Indice Globale 1337x / BitSearch / IlCorsaroNero")
+                                    fileHash = infoHash,
+                                    inspectionSummary = buildPreDownloadInspection(
+                                        fullTitle, ext, 0L, infoHash, 50, "Sito Torrent: $siteDomain"
+                                    )
                                 )
                             )
                         }
-                    }
-                } catch (_: Exception) {}
+                    } catch (_: Exception) {}
+                }
             }
             sub
         }
 
-        // B) Il Corsaro Nero (Indice Italiano)
-        val corsaroJob = async {
+        // B) Indice DHT / ApiBay (Solo per la rete TORRENT, mai mischiato con eD2K!)
+        val dhtJob = async {
             val sub = mutableListOf<SearchResult>()
-            try {
-                val encoded = URLEncoder.encode(variants.first(), "UTF-8")
-                val html = fetchStringGzip("https://ilcorsaronero.link/search?q=$encoded")
-                val magnetRegex = Regex("""(magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^"'\s<>]*)""")
-                magnetRegex.findAll(html).take(25).forEach { m ->
-                    val magnet = m.groupValues[1].replace("&amp;", "&")
-                    val rawTitle = extractNameFromMagnet(magnet).ifBlank { variants.first() }
-                    val ext = extractExtension(rawTitle, 200)
-                    val fullTitle = ensureExtensionInName(rawTitle, ext)
-                    sub.add(
-                        SearchResult(
-                            title = fullTitle,
-                            fileExtension = ext,
-                            category = categorizeByExtension(ext),
-                            sizeText = "ITA Verified",
-                            sizeBytes = 0L,
-                            sources = 60,
-                            completeSourcesPercent = 100,
-                            network = NetworkType.TORRENT,
-                            providerName = "Il Corsaro Nero (ITA)",
-                            actionPayload = magnet,
-                            fileHash = magnet.substringAfter("btih:").substringBefore("&"),
-                            inspectionSummary = buildPreDownloadInspection(fullTitle, ext, 0L, magnet.substringAfter("btih:").substringBefore("&"), 60, "Il Corsaro Nero (Archivio Italiano)")
-                        )
-                    )
-                }
-            } catch (_: Exception) {}
-            sub
-        }
-
-        // C) Torrents-CSV & ApiBay (Milioni di hash verificati)
-        val apiBayJob = async {
-            val sub = mutableListOf<SearchResult>()
-            for (q in variants) {
+            for (q in variants.take(3)) {
                 try {
                     val encoded = URLEncoder.encode(q, "UTF-8")
                     val body = fetchStringGzip("https://apibay.org/q.php?q=$encoded")
@@ -400,7 +465,7 @@ class GlobalSearchEngine(private val configDir: File) {
                         for (i in 0 until minOf(arr.length(), 45)) {
                             val obj = arr.getJSONObject(i)
                             val rawName = obj.optString("name", "")
-                            val infoHash = obj.optString("info_hash", "")
+                            val infoHash = obj.optString("info_hash", "").uppercase()
                             val catCode = obj.optString("category", "200").toIntOrNull() ?: 200
                             val seeders = obj.optString("seeders", "0").toIntOrNull() ?: 0
                             val size = obj.optString("size", "0").toLongOrNull() ?: 0L
@@ -420,10 +485,12 @@ class GlobalSearchEngine(private val configDir: File) {
                                         sources = seeders,
                                         completeSourcesPercent = if (seeders > 0) 100 else 30,
                                         network = NetworkType.TORRENT,
-                                        providerName = "DHT / Tracker Globale",
+                                        providerName = "BitTorrent DHT",
                                         actionPayload = magnet,
                                         fileHash = infoHash,
-                                        inspectionSummary = buildPreDownloadInspection(fullTitle, ext, size, infoHash, seeders, "Rete BitTorrent DHT Globale")
+                                        inspectionSummary = buildPreDownloadInspection(
+                                            fullTitle, ext, size, infoHash, seeders, "Rete BitTorrent DHT"
+                                        )
                                     )
                                 )
                             }
@@ -434,107 +501,55 @@ class GlobalSearchEngine(private val configDir: File) {
             sub
         }
 
-        list.addAll(corsaroJob.await())
-        list.addAll(bitSearchJob.await())
-        list.addAll(apiBayJob.await())
+        list.addAll(customSitesJob.await())
+        list.addAll(dhtJob.await())
         list
     }
 
     // =========================================================================
-    // 3. RICERCA RETE eD2K + KAD MULTI-SERVER
+    // 3. RICERCA PURA ED2K + KAD MULTI-SERVER (SOLO VERI FILE ED2K://)
     // =========================================================================
-    private suspend fun searchEd2kAndKadMultiServer(variants: List<String>): List<SearchResult> = coroutineScope {
-        val list = mutableListOf<SearchResult>()
+    private suspend fun searchEd2kAndKadNativeOnly(variants: List<String>): List<SearchResult> = coroutineScope {
+        val deduplicatedEd2k = linkedMapOf<String, SearchResult>()
         val ed2kManager = Ed2kKadManager(configDir)
         val serverCount = maxOf(16, Ed2kKadManager.activeServers.size)
         val kadNodes = maxOf(512, Ed2kKadManager.activeKadNodesCount)
 
-        // 1. Ricerca UDP nativa sui server eD2K
-        val udpHits = ed2kManager.queryEd2kServersUdp(variants.first())
-        for (hit in udpHits) {
-            val ext = extractExtension(hit.fileName, 200)
-            val ed2kLink = "ed2k://|file|${hit.fileName}|${hit.fileSize}|${hit.md4HashHex}|/"
-            list.add(
-                SearchResult(
+        // Interroga via UDP tutti i server eD2K su ciascuna variante della query
+        for (q in variants.take(2)) {
+            val udpHits = ed2kManager.queryEd2kServersUdp(q)
+            for (hit in udpHits) {
+                val ext = extractExtension(hit.fileName, 200)
+                val ed2kLink = "ed2k://|file|${hit.fileName}|${hit.fileSize}|${hit.md4HashHex}|/"
+                val pctComplete = ((hit.completeSources * 100) / hit.sources.coerceAtLeast(1)).coerceIn(10, 100)
+
+                deduplicatedEd2k[hit.md4HashHex] = SearchResult(
                     title = hit.fileName,
                     fileExtension = ext,
                     category = categorizeByExtension(ext),
                     sizeText = formatSize(hit.fileSize),
                     sizeBytes = hit.fileSize,
                     sources = hit.sources,
-                    completeSourcesPercent = 95,
+                    completeSourcesPercent = pctComplete,
                     network = NetworkType.ED2K_KAD,
-                    providerName = "Server eD2K Diretto",
+                    providerName = "eMule eD2K ($serverCount Srv / $kadNodes KAD)",
                     actionPayload = ed2kLink,
                     fileHash = hit.md4HashHex,
                     inspectionSummary = buildPreDownloadInspection(
-                        hit.fileName, ext, hit.fileSize, hit.md4HashHex, hit.sources, "Server eD2K UDP Diretto"
+                        hit.fileName, ext, hit.fileSize, hit.md4HashHex, hit.sources,
+                        "Rete eMule eD2K ($serverCount Server) + KAD ($kadNodes Nodi)"
                     )
                 )
-            )
-        }
-
-        // 2. Aggregazione Indice Globale KAD + Server eD2K su tutte le varianti
-        val jobs = variants.map { q ->
-            async {
-                val subList = mutableListOf<SearchResult>()
-                try {
-                    val encoded = URLEncoder.encode(q, "UTF-8")
-                    val body = fetchStringGzip("https://apibay.org/q.php?q=$encoded")
-                    if (body.startsWith("[")) {
-                        val arr = JSONArray(body)
-                        for (i in 0 until minOf(arr.length(), 65)) {
-                            val obj = arr.getJSONObject(i)
-                            val rawName = obj.optString("name", "")
-                            val infoHash = obj.optString("info_hash", "")
-                            val catCode = obj.optString("category", "200").toIntOrNull() ?: 200
-                            val seeders = obj.optString("seeders", "0").toIntOrNull() ?: 0
-                            val leechers = obj.optString("leechers", "0").toIntOrNull() ?: 0
-                            val size = obj.optString("size", "0").toLongOrNull() ?: 0L
-
-                            if (rawName.isNotBlank() && rawName != "No results returned" && infoHash.length == 40) {
-                                val ext = extractExtension(rawName, catCode)
-                                val fileNameWithExt = ensureExtensionInName(rawName, ext)
-                                val ed2kHash = generateDeterministicMd4Hex(infoHash)
-                                val totalSources = (seeders + leechers + (serverCount / 2)).coerceAtLeast(1)
-                                val completePct = if (totalSources > 0) ((seeders * 100) / totalSources).coerceIn(45, 100) else 80
-                                val magnetPayload = "magnet:?xt=urn:btih:$infoHash&dn=${URLEncoder.encode(fileNameWithExt, "UTF-8")}"
-
-                                subList.add(
-                                    SearchResult(
-                                        title = fileNameWithExt,
-                                        fileExtension = ext,
-                                        category = categorizeByExtension(ext),
-                                        sizeText = formatSize(size),
-                                        sizeBytes = size,
-                                        sources = totalSources,
-                                        completeSourcesPercent = completePct,
-                                        network = NetworkType.ED2K_KAD,
-                                        providerName = "eD2K ($serverCount srv) + KAD ($kadNodes nodi)",
-                                        actionPayload = magnetPayload,
-                                        fileHash = ed2kHash,
-                                        inspectionSummary = buildPreDownloadInspection(
-                                            fileNameWithExt, ext, size, ed2kHash, totalSources,
-                                            "Rete eD2K ($serverCount Server) + KAD ($kadNodes Nodi)"
-                                        )
-                                    )
-                                )
-                            }
-                        }
-                    }
-                } catch (_: Exception) {}
-                subList
             }
         }
 
-        jobs.forEach { list.addAll(it.await()) }
-        list
+        deduplicatedEd2k.values.toList()
     }
 
     private fun extractNameFromMagnet(magnet: String): String {
         val m = Regex("[?&]dn=([^&]+)").find(magnet) ?: return ""
         return try {
-            java.net.URLDecoder.decode(m.groupValues[1], "UTF-8")
+            URLDecoder.decode(m.groupValues[1], "UTF-8")
         } catch (_: Exception) {
             m.groupValues[1]
         }
@@ -624,16 +639,6 @@ class GlobalSearchEngine(private val configDir: File) {
                 "• Hash Identificativo: $hash"
     }
 
-    private fun generateDeterministicMd4Hex(seed: String): String {
-        return try {
-            val md = MessageDigest.getInstance("MD5")
-            md.update(seed.toByteArray())
-            md.digest().joinToString("") { "%02X".format(it) }
-        } catch (_: Exception) {
-            seed.uppercase().take(32)
-        }
-    }
-
     private fun fetchStringGzip(url: String): String {
         val request = Request.Builder()
             .url(url)
@@ -658,4 +663,4 @@ class GlobalSearchEngine(private val configDir: File) {
         return if (mb >= 1024) String.format("%.2f GB", mb / 1024.0)
         else String.format("%.1f MB", mb)
     }
-}                         
+}
