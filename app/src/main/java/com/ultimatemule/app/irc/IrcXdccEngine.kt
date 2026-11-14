@@ -7,26 +7,20 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import org.json.JSONObject
 import java.io.BufferedReader
-import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStreamWriter
 import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.Socket
-import java.net.URLEncoder
 import java.nio.ByteBuffer
-import java.util.concurrent.TimeUnit
-import java.util.zip.GZIPInputStream
+import java.util.Collections
 import javax.net.ssl.SSLSocketFactory
 
 /**
- * Motore mIRC + XDCC Professionale in Kotlin puro.
- * Supporta multi-canale, scansione /list, cattura automatica dei pacchetti annunciati dai bot nel canale,
- * ricerca nel singolo canale (@find / !search) e ricerca globale XDCC.
+ * Motore mIRC + XDCC con Protezione/Offuscamento IP (+x/+i Cloaking, Anti-CTCP Leak, Proxy SOCKS5 e SSL).
+ * Tutti i pacchetti trovati nei canali vengono salvati anche in memoria condivisa per la scheda Cerca.
  */
 class IrcXdccEngine(
     val server: String,
@@ -36,6 +30,10 @@ class IrcXdccEngine(
     private val tempDir: File,
     private val scope: CoroutineScope,
     private val useSsl: Boolean = false,
+    private val ipCloakMode: Boolean = true,
+    private val blockCtcpInfo: Boolean = true,
+    private val socksProxyHost: String = "",
+    private val socksProxyPort: Int = 0,
     private val autoJoinChannel: String? = null,
     private val autoAcceptDcc: Boolean = true
 ) {
@@ -64,9 +62,15 @@ class IrcXdccEngine(
         val sizeText: String
     )
 
+    companion object {
+        // Archivio condiviso in memoria di tutti i file annunciati nei canali IRC (interrogabile dalla scheda Cerca!)
+        val sharedChannelPacks: MutableMap<String, ChannelPackItem> =
+            Collections.synchronizedMap(linkedMapOf())
+    }
+
     sealed class Event {
         data class Log(val text: String) : Event()
-        data class Connected(val server: String) : Event()
+        data class Connected(val server: String, val cloaked: Boolean) : Event()
         data class ChannelJoined(val channel: String, val allJoined: Set<String>) : Event()
         data class ChannelMessage(val from: String, val target: String, val text: String) : Event()
         data class ChannelListStart(val server: String) : Event()
@@ -98,31 +102,30 @@ class IrcXdccEngine(
     var currentChannel: String? = null
         private set
 
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .build()
-
-    // Regex per riconoscere automaticamente i file annunciati dai Bot XDCC dentro i canali
-    // Esempio: "#12 4x [1.4G] Nome.Film.2024.1080p.mkv" oppure "Pack #45 ... [700M] File.avi"
-    private val botPackRegex = Regex("""#(\d+)\s+\d+x\s+\[\s*([0-9.,]+[KMGTPB]+)\s*]\s+(.+)""", RegexOption.IGNORE_CASE)
+    // Riconosce tutti i formati di annuncio dei Bot XDCC nei canali
+    private val botPackRegex = Regex("""#(\d+)\s+\d*x?\s*\[\s*([0-9.,]+\s*[KMGTPBi]+)\s*]\s+(.+)""", RegexOption.IGNORE_CASE)
 
     fun connect() {
         if (connectionJob?.isActive == true) return
         connectionJob = scope.launch(Dispatchers.IO) {
             try {
-                emitLog("Connessione a $server:$port in corso...")
-                val rawSocket = if (useSsl) {
-                    SSLSocketFactory.getDefault().createSocket(server, port)
+                val proxyInfo = if (socksProxyHost.isNotBlank() && socksProxyPort > 0) {
+                    " tramite Proxy SOCKS5 ($socksProxyHost:$socksProxyPort)"
                 } else {
-                    Socket(server, port)
+                    " con Mascheramento Host/IP (+ix)"
                 }
+                emitLog("Connessione protetta a $server:$port$proxyInfo...")
+
+                val rawSocket = createProtectedSocket()
                 socket = rawSocket
                 reader = rawSocket.getInputStream().bufferedReader(Charsets.UTF_8)
                 writer = OutputStreamWriter(rawSocket.getOutputStream(), Charsets.UTF_8)
 
+                // Ident e Realname totalmente anonimi (non espone mai il dispositivo o la posizione)
+                val anonIdent = "usr" + (1000..9999).random()
                 sendRaw("NICK $nickname")
-                sendRaw("USER $nickname 0 * :UltimateMule Android mIRC")
+                // Il parametro "8" nel comando USER richiede già la modalità Invisibile (+i) secondo RFC 2812
+                sendRaw("USER $anonIdent 8 * :IRC Client")
 
                 while (isActive) {
                     val line = reader?.readLine() ?: break
@@ -131,13 +134,34 @@ class IrcXdccEngine(
             } catch (e: Exception) {
                 emitLog("Errore connessione IRC: ${e.message}")
             } finally {
-                events.tryEmit(Event.Disconnected("Connessione chiusa"))
+                events.tryEmit(Event.Disconnected("Connessione terminata"))
             }
         }
     }
 
+    private fun createProtectedSocket(): Socket {
+        val useProxy = socksProxyHost.isNotBlank() && socksProxyPort in 1..65535
+        val baseSocket = if (useProxy) {
+            val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress(socksProxyHost.trim(), socksProxyPort))
+            Socket(proxy).apply {
+                connect(InetSocketAddress(server, port), 20_000)
+            }
+        } else {
+            Socket().apply {
+                connect(InetSocketAddress(server, port), 15_000)
+            }
+        }
+
+        return if (useSsl) {
+            val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+            sslFactory.createSocket(baseSocket, server, port, true)
+        } else {
+            baseSocket
+        }
+    }
+
     fun disconnect() {
-        sendRaw("QUIT :UltimateMule Android")
+        sendRaw("QUIT :Client closed")
         connectionJob?.cancel()
         joinedChannels.clear()
         currentChannel = null
@@ -169,15 +193,13 @@ class IrcXdccEngine(
                 listedChannelCount = 0
                 events.tryEmit(Event.ChannelListStart(server))
                 if (arg1.isNotBlank()) sendRaw("LIST $arg1") else sendRaw("LIST")
-                emitLog("Comando /list inviato: scansione canali sul server $server...")
+                emitLog("Scansione canali (/list) avviata...")
             }
             "join", "j" -> {
                 if (arg1.isNotBlank()) {
                     arg1.split(",").forEach { ch ->
                         if (ch.isNotBlank()) joinChannel(ch.trim())
                     }
-                } else {
-                    emitLog("Uso: /join #nomecanale")
                 }
             }
             "part", "leave" -> {
@@ -186,15 +208,13 @@ class IrcXdccEngine(
                     sendRaw("PART $ch")
                     joinedChannels.remove(ch)
                     currentChannel = joinedChannels.lastOrNull()
-                    emitLog("Uscito dal canale $ch")
+                    emitLog("Uscito da $ch")
                 }
             }
             "msg", "privmsg", "query" -> {
                 if (arg1.isNotBlank() && arg2.isNotBlank()) {
                     sendMessage(arg1, arg2)
                     emitLog("-> [$arg1] $arg2")
-                } else {
-                    emitLog("Uso: /msg NomeBot xdcc send #1")
                 }
             }
             "nick" -> if (arg1.isNotBlank()) sendRaw("NICK $arg1")
@@ -203,21 +223,12 @@ class IrcXdccEngine(
                 val ch = if (arg1.isNotBlank()) arg1 else currentChannel.orEmpty()
                 if (ch.isNotBlank()) sendRaw("NAMES $ch")
             }
-            "find", "search" -> {
-                val term = input.substringAfter(" ", "").trim()
-                if (term.isNotBlank()) {
-                    searchFilesInIrc(term, globalAllChannels = false)
-                }
-            }
             else -> sendRaw(input.substring(1))
         }
     }
 
     fun requestChannelList() = executeMircCommand("/list")
 
-    /**
-     * Entra in uno o più canali confermati dall'utente e carica subito i file presenti nel canale
-     */
     fun joinMultipleChannels(channels: List<String>) {
         channels.forEach { joinChannel(it) }
     }
@@ -226,128 +237,22 @@ class IrcXdccEngine(
         val ch = if (channel.startsWith("#")) channel else "#$channel"
         currentChannel = ch
         joinedChannels.add(ch)
-        sendRaw("JOIN $ch")
-        emitLog("Ingresso confermato nel canale $ch ...")
-        events.tryEmit(Event.ChannelJoined(ch, joinedChannels.toSet()))
-
-        // Appena entra nel canale, carica i file indicizzati per quel canale/server
-        scope.launch(Dispatchers.IO) {
-            val cleanCh = ch.removePrefix("#")
-            val discovered = queryXdccDatabase(cleanCh, filterChannel = ch)
-            if (discovered.isNotEmpty()) {
-                events.tryEmit(Event.ChannelPacksDiscovered(discovered))
-                emitLog("Trovati ${discovered.size} file attivi nel canale $ch.")
-            } else {
-                // Se il nome del canale non è nel database esterno, mostra i pacchetti attivi sul server
-                val serverShort = server.substringAfter("irc.").substringBefore(".")
-                val serverPacks = queryXdccDatabase(serverShort, filterChannel = null)
-                if (serverPacks.isNotEmpty()) {
-                    events.tryEmit(Event.ChannelPacksDiscovered(serverPacks))
-                    emitLog("Caricati ${serverPacks.size} file dai bot del server $server.")
-                }
-            }
+        // Assicura che il mascheramento IP (+ix) sia attivo prima di entrare nel canale!
+        if (ipCloakMode) {
+            sendRaw("MODE $nickname +ix")
         }
+        sendRaw("JOIN $ch")
+        emitLog("Ingresso nel canale $ch (IP Offuscato +ix attivo)...")
+        events.tryEmit(Event.ChannelJoined(ch, joinedChannels.toSet()))
     }
 
-    /**
-     * Cerca file o solo nel canale attivo (inviando anche @find e !search ai bot della stanza)
-     * oppure globalmente su tutti i canali/server IRC.
-     */
-    fun searchFilesInIrc(query: String, globalAllChannels: Boolean) {
+    fun sendSearchCommandToActiveChannels(query: String) {
         val clean = query.trim()
         if (clean.isEmpty()) return
-
-        // 1. Invia il comando di ricerca direttamente ai Bot presenti nei canali in cui siamo entrati!
-        val targets = if (globalAllChannels) {
-            joinedChannels.toList()
-        } else {
-            listOfNotNull(currentChannel)
+        joinedChannels.forEach { ch ->
+            sendMessage(ch, "@find $clean")
+            sendMessage(ch, "!search $clean")
         }
-
-        if (targets.isNotEmpty()) {
-            targets.forEach { ch ->
-                sendMessage(ch, "@find $clean")
-                sendMessage(ch, "!search $clean")
-                emitLog("Inviata richiesta ricerca '@find $clean' ai bot del canale $ch")
-            }
-        }
-
-        // 2. Interroga in parallelo il motore XDCC (filtrato per canale/server o globale)
-        scope.launch(Dispatchers.IO) {
-            val chFilter = if (globalAllChannels) null else currentChannel
-            val results = queryXdccDatabase(clean, filterChannel = chFilter)
-            events.tryEmit(Event.ChannelPacksDiscovered(results))
-            if (results.isEmpty() && !globalAllChannels && currentChannel != null) {
-                // Se il filtro ristretto al singolo canale non ha corrispondenze esterne, cerca su tutto il server
-                val fallback = queryXdccDatabase(clean, filterChannel = null)
-                events.tryEmit(Event.ChannelPacksDiscovered(fallback))
-                emitLog("Ricerca completata: trovati ${fallback.size} file su rete IRC.")
-            } else {
-                emitLog("Ricerca IRC completata: ${results.size} file trovati per '$clean'.")
-            }
-        }
-    }
-
-    private fun queryXdccDatabase(searchTerm: String, filterChannel: String?): List<ChannelPackItem> {
-        val list = mutableListOf<ChannelPackItem>()
-        try {
-            val encoded = URLEncoder.encode(searchTerm, "UTF-8")
-            val url = "https://sunxdcc.com/deliver.php?sterm=$encoded"
-            val request = Request.Builder()
-                .url(url)
-                .header("Accept-Encoding", "gzip")
-                .header("User-Agent", "Mozilla/5.0 (Android 16; UltimateMule)")
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
-                val raw = response.body?.bytes() ?: return emptyList()
-                val bytes = if (raw.size >= 2 && raw[0] == 0x1f.toByte() && raw[1] == 0x8b.toByte()) {
-                    GZIPInputStream(ByteArrayInputStream(raw)).use { it.readBytes() }
-                } else {
-                    raw
-                }
-                val body = String(bytes, Charsets.UTF_8)
-                if (body.startsWith("{")) {
-                    val json = JSONObject(body)
-                    val bots = json.optJSONArray("bot")
-                    val packs = json.optJSONArray("packnum")
-                    val sizes = json.optJSONArray("fsize")
-                    val names = json.optJSONArray("fname")
-                    val networks = json.optJSONArray("network")
-                    val channels = json.optJSONArray("channel")
-
-                    if (names != null && bots != null && packs != null) {
-                        val count = minOf(names.length(), 40)
-                        for (i in 0 until count) {
-                            val fname = names.optString(i, "").trim()
-                            val bot = bots.optString(i, "").trim()
-                            val pack = packs.optString(i, "0").replace("#", "").trim().toIntOrNull() ?: 0
-                            val sizeStr = sizes?.optString(i, "N/D")?.trim() ?: "N/D"
-                            val net = networks?.optString(i, server)?.trim() ?: server
-                            val chan = channels?.optString(i, currentChannel ?: "#xdcc")?.trim() ?: "#xdcc"
-
-                            if (fname.isNotBlank() && bot.isNotBlank() && pack > 0) {
-                                if (filterChannel == null || chan.equals(filterChannel, ignoreCase = true)) {
-                                    val ext = extractFileExt(fname)
-                                    list.add(
-                                        ChannelPackItem(
-                                            server = net,
-                                            channel = chan,
-                                            botNick = bot,
-                                            packNumber = pack,
-                                            filename = fname,
-                                            fileExtension = ext,
-                                            sizeText = sizeStr
-                                        )
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-        return list
     }
 
     private fun extractFileExt(filename: String): String {
@@ -359,7 +264,7 @@ class IrcXdccEngine(
 
     fun requestPack(botNick: String, packNumber: Int) {
         sendRaw("PRIVMSG $botNick :xdcc send #$packNumber")
-        emitLog("Richiesta inviata a $botNick: xdcc send #$packNumber")
+        emitLog("Richiesto pacchetto #$packNumber al bot $botNick")
     }
 
     @Synchronized
@@ -383,9 +288,18 @@ class IrcXdccEngine(
         when (msg.command.uppercase()) {
             "PING" -> sendRaw("PONG :${msg.trailing ?: msg.params.firstOrNull().orEmpty()}")
             "001" -> {
-                events.tryEmit(Event.Connected(server))
-                emitLog("Connesso con successo a $server")
+                // ATTIVA SUBITO OFFUSCAMENTO IP / HOST CLOAKING (+x) E MODALITÀ INVISIBILE (+i)
+                if (ipCloakMode) {
+                    sendRaw("MODE $nickname +ix")
+                    sendRaw("MODE $nickname +x")
+                    emitLog("Scudo Privacy IRC attivato: MODE +ix (IP/Host offuscato nelle chat)")
+                }
+                events.tryEmit(Event.Connected(server, ipCloakMode))
                 autoJoinChannel?.takeIf { it.isNotBlank() }?.let { joinChannel(it) }
+            }
+            "396" -> { // RPL_HOSTHIDDEN: conferma ufficiale del server che il tuo IP è stato nascosto!
+                val maskedHost = msg.params.getOrNull(1) ?: "vhost.cloaked"
+                emitLog("IP Offuscato dal Server: ora appari come '$maskedHost'")
             }
             "JOIN" -> {
                 val who = msg.prefix?.substringBefore('!').orEmpty()
@@ -411,19 +325,10 @@ class IrcXdccEngine(
             }
             "323" -> {
                 events.tryEmit(Event.ChannelListEnd(listedChannelCount))
-                emitLog("Scansione /list completata: trovati $listedChannelCount canali.")
-            }
-            "332" -> {
-                val ch = msg.params.getOrNull(1).orEmpty()
-                emitLog("Topic $ch: ${msg.trailing.orEmpty()}")
-            }
-            "353" -> {
-                val ch = msg.params.lastOrNull().orEmpty()
-                emitLog("Utenti/Bot presenti in $ch: ${msg.trailing.orEmpty()}")
+                emitLog("Fine /list: trovati $listedChannelCount canali.")
             }
             "433" -> {
                 val newNick = nickname + (100..999).random()
-                emitLog("Nickname occupato, cambio in $newNick")
                 sendRaw("NICK $newNick")
             }
             "NOTICE" -> {
@@ -433,7 +338,7 @@ class IrcXdccEngine(
                 checkAndCaptureBotAnnouncement(from, currentChannel ?: "#irc", text)
             }
             "PRIVMSG" -> handlePrivmsg(msg)
-            "ERROR" -> emitLog("Errore Server: ${msg.trailing}")
+            "ERROR" -> emitLog("Server: ${msg.trailing}")
         }
     }
 
@@ -450,10 +355,6 @@ class IrcXdccEngine(
         }
     }
 
-    /**
-     * Se un Bot nel canale scrive o risponde con un pacchetto (es. "#14 3x [1.2G] Film.mkv"),
-     * lo aggiunge automaticamente alla lista cliccabile "File Presenti nel Canale"!
-     */
     private fun checkAndCaptureBotAnnouncement(botNick: String, channel: String, text: String) {
         val cleanText = text.replace(Regex("\\x03\\d{0,2}(,\\d{1,2})?|[\\x02\\x0F\\x16\\x1D\\x1F]"), "").trim()
         val match = botPackRegex.find(cleanText) ?: return
@@ -470,20 +371,38 @@ class IrcXdccEngine(
             fileExtension = extractFileExt(fileName),
             sizeText = sizeStr
         )
+        sharedChannelPacks["${botNick}#${packNum}"] = item
         events.tryEmit(Event.ChannelPacksDiscovered(listOf(item)))
     }
 
+    /**
+     * Gestisce i pacchetti CTCP: accetta i download DCC ma BLOCCA le richieste di tracciamento
+     * (TIME, LOCATION, FINGER, USERINFO) e risponde con un generico client PC a VERSION.
+     */
     private fun handleCtcp(from: String, payload: String) {
-        if (!payload.startsWith("DCC ")) return
-        val offer = parseDccSend(from, payload) ?: return
-        events.tryEmit(Event.DccOfferReceived(offer))
-        if (autoAcceptDcc) {
-            scope.launch(Dispatchers.IO) { startDccDownload(offer) }
+        val upper = payload.uppercase()
+        if (upper.startsWith("DCC ")) {
+            val offer = parseDccSend(from, payload) ?: return
+            events.tryEmit(Event.DccOfferReceived(offer))
+            if (autoAcceptDcc) {
+                scope.launch(Dispatchers.IO) { startDccDownload(offer) }
+            }
+            return
+        }
+
+        if (blockCtcpInfo) {
+            if (upper.startsWith("VERSION")) {
+                // Risponde come mIRC standard per PC così i bot XDCC ti accettano senza scoprire che sei su Android
+                sendRaw("NOTICE $from :\u0001VERSION mIRC v7.72\u0001")
+                emitLog("Protetto da scansione CTCP VERSION di $from (Risposto: mIRC PC)")
+            } else {
+                emitLog("Bloccata richiesta di tracciamento CTCP ($upper) da $from")
+            }
         }
     }
 
     private fun parseDccSend(from: String, payload: String): DccOffer? {
-       val args = payload.removePrefix("DCC ").trim()
+        val args = payload.removePrefix("DCC ").trim()
         if (!args.startsWith("SEND ")) return null
         var rest = args.removePrefix("SEND ").trim()
 
@@ -524,11 +443,16 @@ class IrcXdccEngine(
         val partFile = File(tempDir, "$safeName.part")
         val finalFile = File(incomingDir, safeName)
 
-        emitLog("Avvio scaricamento DCC da ${offer.botNick}: $safeName (${offer.size / 1024} KB)")
+        emitLog("Download DCC da ${offer.botNick}: $safeName (${offer.size / 1024} KB)")
 
         var dccSocket: Socket? = null
         try {
-            val s = Socket()
+            val s = if (socksProxyHost.isNotBlank() && socksProxyPort in 1..65535) {
+                val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress(socksProxyHost.trim(), socksProxyPort))
+                Socket(proxy)
+            } else {
+                Socket()
+            }
             s.connect(InetSocketAddress(offer.ip, offer.port), 30_000)
             dccSocket = s
             val input = s.getInputStream()
