@@ -5,12 +5,15 @@ pluginManagement {
         gradlePluginPortal()
     }
 }
+
+// Rimosse le restrizioni per permettere a Gradle di cercare su tutti i server disponibili
 dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
         mavenCentral()
+        maven { url = uri("https://jitpack.io") } // FONDAMENTALE per PircBotX e Torrent
     }
 }
+
 rootProject.name = "UltimateMule"
 include(":app")
