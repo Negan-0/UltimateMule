@@ -2,6 +2,7 @@ package com.ultimatemule.app.ui
 
 import android.app.AlertDialog
 import android.graphics.Color
+import android.graphics.Typeface
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.ProgressBar
