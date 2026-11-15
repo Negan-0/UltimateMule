@@ -269,12 +269,13 @@ class Ed2kKadManager(private val configDir: File) {
         var socket: DatagramSocket? = null
         try {
             socket = DatagramSocket()
-            socket.soTimeout = 700
+            socket.soTimeout = 1800
             socket.receiveBufferSize = 256 * 1024
 
             for (srv in serversToQuery) {
                 try {
                     val addr = InetAddress.getByName(srv.ip)
+                    if (srv.port <= 0) continue
                     val udpPort = srv.port + 4
                     socket.send(DatagramPacket(pkt98, pkt98.size, addr, udpPort))
                     socket.send(DatagramPacket(pkt90, pkt90.size, addr, udpPort))
@@ -283,7 +284,7 @@ class Ed2kKadManager(private val configDir: File) {
 
             val recvBuf = ByteArray(65535)
             val start = System.currentTimeMillis()
-            while (System.currentTimeMillis() - start < 3200) {
+            while (System.currentTimeMillis() - start < 4000) {
                 try {
                     val recvPacket = DatagramPacket(recvBuf, recvBuf.size)
                     socket.receive(recvPacket)
@@ -482,6 +483,7 @@ class Ed2kKadManager(private val configDir: File) {
                                 if (buf.remaining() < 6) break
                                 val ipInt = buf.int
                                 val port = buf.short.toInt() and 0xFFFF
+                                if (port <= 0) continue
                                 val ipStr = "${ipInt and 0xFF}.${(ipInt shr 8) and 0xFF}.${(ipInt shr 16) and 0xFF}.${(ipInt shr 24) and 0xFF}"
                                 if (port > 0 && ipInt != 0) {
                                     sources["$ipStr:$port"] = Ed2kPeerSource(ipStr, port)
