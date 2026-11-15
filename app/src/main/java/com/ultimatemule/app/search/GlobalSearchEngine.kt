@@ -175,11 +175,8 @@ class GlobalSearchEngine(private val configDir: File) {
         }
 
         var allResults = deduplicatedMap.values.toList()
-
-        // Se l'utente ha scritto "ita" nella barra di ricerca o ha impostato "Solo Italiano",
-        // scarta i risultati stranieri che non contengono ITA/ITALIAN/MULTI/SUB-ITA
-        if (requireItalianMatch) {
-            val itaRegex = Regex("\\b(ita|italiano|italian|multi|dual|sub[.\\s_-]*ita|iTALiAN)\\b", RegexOption.IGNORE_CASE)
+        if (requireItalianMatch && langPref == LanguagePreference.ITALIAN_STRICT) {
+            val itaRegex = Regex("\\b(ita|italiano|italian|multi|dual|sub[.\\s_-]*ita)\\b", RegexOption.IGNORE_CASE)
             val onlyItalian = allResults.filter { res ->
                 itaRegex.containsMatchIn(res.title) || res.providerName.contains("ITA", ignoreCase = true)
             }
@@ -194,20 +191,18 @@ class GlobalSearchEngine(private val configDir: File) {
             val strictCat = allResults.filter { it.category == catFilter }
             strictCat.ifEmpty { allResults }
         }
-
-        // Token di rilevanza (inclusi S01E03 / 1x03 / ITA)
-        val allTokens = queryVariants.first().lowercase()
-            .replace('.', ' ')
-            .replace('_', ' ')
-            .split(" ")
-            .filter { it.length >= 2 }
-
+        val baseQueryToken = queryVariants.first().lowercase().replace(Regex("\\b(ita|italiano|eng)\\b"), "").trim()
+        val allTokens = baseQueryToken.replace('.', ' ').replace('_', ' ').split(" ").filter { it.length >= 2 }
         filtered.sortedWith(
             compareByDescending<SearchResult> { res ->
                 val normalizedTitle = res.title.lowercase().replace('.', ' ').replace('_', ' ')
                 var score = allTokens.count { token -> normalizedTitle.contains(token) } * 10
-                if (Regex("\\b(ita|italiano|italian)\\b", RegexOption.IGNORE_CASE).containsMatchIn(res.title)) {
-                    score += if (requireItalianMatch || langPref == LanguagePreference.ITALIAN_PRIORITY) 25 else 5
+                val hasItaTag = Regex("\\b(ita|italiano|italian|multi|dual|sub[.\\s_-]*ita)\\b", RegexOption.IGNORE_CASE).containsMatchIn(res.title)
+                if (hasItaTag) {
+                    score += when (langPref) {
+                        LanguagePreference.ITALIAN_STRICT, LanguagePreference.ITALIAN_PRIORITY -> 40
+                        else -> 15
+                    }
                 }
                 score
             }.thenByDescending { it.sources }
