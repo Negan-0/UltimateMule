@@ -33,10 +33,6 @@ class GlobalSearchEngine(private val configDir: File) {
         ALL, VIDEO, AUDIO, ARCHIVE, SOFTWARE_DOC
     }
 
-    enum class LanguagePreference {
-        ANY, ITALIAN_PRIORITY, ITALIAN_STRICT, ENGLISH
-    }
-
     data class SearchResult(
         val title: String,
         val fileExtension: String,
@@ -72,79 +68,23 @@ class GlobalSearchEngine(private val configDir: File) {
         .build()
 
     /**
-     * Costruisce le varianti intelligenti della query SENZA MAI CANCELLARE "ITA":
-     * Es: "the Boys s01 e 3 ita" ->
-     * 1) "the Boys S01E03 ita"
-     * 2) "the Boys 1x03 ita"
-     * 3) "the Boys s01 e 3 ita"
-     * 4) "the Boys S01E03 italian"
+     * Utilizza esattamente ciò che l'utente ha scritto, senza alterazioni o aggiunte automatiche di lingua.
      */
-    private fun buildSmartQueryVariants(
-        rawQuery: String,
-        langPref: LanguagePreference
-    ): List<String> {
-        val variants = linkedSetOf<String>()
-        var clean = rawQuery.trim().replace(Regex("\\s+"), " ")
-
-        // Se l'utente ha impostato Italiano Prioritario/Obbligatorio e non ha scritto "ita", lo aggiunge come variante primaria
-        val userWroteIta = Regex("\\b(ita|italiano|italian|sub[.\\s_-]*ita)\\b", RegexOption.IGNORE_CASE)
-            .containsMatchIn(clean)
-
-        if (!userWroteIta && (langPref == LanguagePreference.ITALIAN_PRIORITY || langPref == LanguagePreference.ITALIAN_STRICT)) {
-            clean = "$clean ita"
-        } else if (!userWroteIta && langPref == LanguagePreference.ENGLISH) {
-            clean = "$clean eng"
-        }
-
-        // Normalizza pattern serie TV: "s01 e 3", "s1 e03", "s01ep03", "stagione 1 episodio 3" -> "S01E03" e "1x03"
-        val epRegex = Regex("""\bs(?:tagione)?\s*0*(\d{1,2})\s*[-._\s]*e(?:p|pisodio)?\s*0*(\d{1,3})\b""", RegexOption.IGNORE_CASE)
-        val epMatch = epRegex.find(clean)
-
-        if (epMatch != null) {
-            val seasonNum = epMatch.groupValues[1].toIntOrNull() ?: 1
-            val epNum = epMatch.groupValues[2].toIntOrNull() ?: 1
-            val s00e00 = String.format("S%02dE%02d", seasonNum, epNum)
-            val sXe00 = String.format("%dx%02d", seasonNum, epNum)
-
-            val normalizedS00E00 = clean.replace(epRegex, s00e00)
-            val normalized1x00 = clean.replace(epRegex, sXe00)
-
-            variants.add(normalizedS00E00)
-            variants.add(normalized1x00)
-
-            if (userWroteIta || langPref == LanguagePreference.ITALIAN_PRIORITY || langPref == LanguagePreference.ITALIAN_STRICT) {
-                variants.add(
-                    normalizedS00E00.replace(Regex("\\b(ita|italiano)\\b", RegexOption.IGNORE_CASE), "ITALIAN")
-                )
-            }
-        }
-
-        variants.add(clean)
-
-        // Aggiunge variante con "italian" invece di "ita" (senza mai rimuovere il filtro lingua!)
-        if (userWroteIta) {
-            val withItalian = clean.replace(Regex("\\b(ita|italiano)\\b", RegexOption.IGNORE_CASE), "italian")
-            variants.add(withItalian)
-        }
-
-        return variants.toList()
+    private fun buildSmartQueryVariants(rawQuery: String): List<String> {
+        val clean = rawQuery.trim().replace(Regex("\\s+"), " ")
+        return listOf(clean)
     }
 
     suspend fun search(
         query: String,
         netFilter: NetworkType,
         catFilter: FileCategory = FileCategory.ALL,
-        langPref: LanguagePreference = LanguagePreference.ANY,
         customTorrentSiteTemplates: List<String> = emptyList()
     ): List<SearchResult> = withContext(Dispatchers.IO) {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return@withContext emptyList()
 
-        val userExplicitlyWroteIta = Regex("\\b(ita|italiano|italian)\\b", RegexOption.IGNORE_CASE)
-            .containsMatchIn(cleanQuery)
-        val requireItalianMatch = userExplicitlyWroteIta || langPref == LanguagePreference.ITALIAN_STRICT
-
-        val queryVariants = buildSmartQueryVariants(cleanQuery, langPref)
+        val queryVariants = buildSmartQueryVariants(cleanQuery)
         val deduplicatedMap = linkedMapOf<String, SearchResult>()
 
         coroutineScope {
@@ -174,16 +114,7 @@ class GlobalSearchEngine(private val configDir: File) {
             }
         }
 
-        var allResults = deduplicatedMap.values.toList()
-        if (requireItalianMatch && langPref == LanguagePreference.ITALIAN_STRICT) {
-            val itaRegex = Regex("\\b(ita|italiano|italian|multi|dual|sub[.\\s_-]*ita)\\b", RegexOption.IGNORE_CASE)
-            val onlyItalian = allResults.filter { res ->
-                itaRegex.containsMatchIn(res.title) || res.providerName.contains("ITA", ignoreCase = true)
-            }
-            if (onlyItalian.isNotEmpty()) {
-                allResults = onlyItalian
-            }
-        }
+        val allResults = deduplicatedMap.values.toList()
 
         val filtered = if (catFilter == FileCategory.ALL) {
             allResults
@@ -191,20 +122,19 @@ class GlobalSearchEngine(private val configDir: File) {
             val strictCat = allResults.filter { it.category == catFilter }
             strictCat.ifEmpty { allResults }
         }
-        val baseQueryToken = queryVariants.first().lowercase().replace(Regex("\\b(ita|italiano|eng)\\b"), "").trim()
-        val allTokens = baseQueryToken.replace('.', ' ').replace('_', ' ').split(" ").filter { it.length >= 2 }
+
+        // Token basati esclusivamente su ciò che hai digitato nella barra di ricerca
+        val tokens = cleanQuery.lowercase()
+            .replace('.', ' ')
+            .replace('_', ' ')
+            .split(" ")
+            .filter { it.length >= 2 }
+
+        // Ordinamento pulito: priorità ai file che contengono le tue parole chiave nel titolo, ordinati per numero di fonti
         filtered.sortedWith(
             compareByDescending<SearchResult> { res ->
                 val normalizedTitle = res.title.lowercase().replace('.', ' ').replace('_', ' ')
-                var score = allTokens.count { token -> normalizedTitle.contains(token) } * 10
-                val hasItaTag = Regex("\\b(ita|italiano|italian|multi|dual|sub[.\\s_-]*ita)\\b", RegexOption.IGNORE_CASE).containsMatchIn(res.title)
-                if (hasItaTag) {
-                    score += when (langPref) {
-                        LanguagePreference.ITALIAN_STRICT, LanguagePreference.ITALIAN_PRIORITY -> 40
-                        else -> 15
-                    }
-                }
-                score
+                tokens.count { token -> normalizedTitle.contains(token) } * 10
             }.thenByDescending { it.sources }
         )
     }
