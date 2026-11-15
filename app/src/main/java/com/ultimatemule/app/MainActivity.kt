@@ -16,6 +16,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.Button
 import com.ultimatemule.app.ed2k.Ed2kKadManager
 import com.ultimatemule.app.ed2k.Ed2kTransferState
 import com.ultimatemule.app.irc.IrcXdccEngine
