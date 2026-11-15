@@ -4,10 +4,10 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
 import android.view.Gravity
-import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
@@ -51,7 +51,7 @@ object NetworksScreenBuilder {
                 adapter = ArrayAdapter(activity, android.R.layout.simple_spinner_dropdown_item, modes)
                 setBackgroundColor(Color.parseColor("#262B36"))
                 onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                    override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    override fun onItemSelected(parent: AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
                         activity.selectedEd2kConnectionMode = position
                         if (!Ed2kKadManager.isConnected) updateConnectButtonLabel(activity)
                     }
@@ -63,8 +63,8 @@ object NetworksScreenBuilder {
             val kadUrlsInput = UiComponents.styledEditText(activity, savedKadUrls).apply { minLines = 2 }
             val serverUrlsInput = UiComponents.styledEditText(activity, savedServerUrls).apply { minLines = 3 }
 
-            // Riferimento al pulsante di connessione globale memorizzato nella Activity
-            activity.btnGlobalConnectToggle = UiComponents.compactButton(activity, "CONNETTI (SERVER + KAD)", "#16A34A") {
+            // Inizializziamo il pulsante e lo assegniamo alla proprietà della MainActivity
+            val connectButton = UiComponents.compactButton(activity, "CONNETTI (SERVER + KAD)", "#16A34A") {
                 if (Ed2kKadManager.isConnected) {
                     Ed2kKadManager.disconnectAll()
                     updateConnectButtonLabel(activity)
@@ -119,9 +119,11 @@ object NetworksScreenBuilder {
                     }
                 }
             }
-            addView(activity.btnGlobalConnectToggle)
 
-            activity.serverListLog = TextView(activity).apply {
+            activity.btnGlobalConnectToggle = connectButton
+            addView(connectButton)
+
+            val logView = TextView(activity).apply {
                 text = "Seleziona la modalità qui sopra e premi il tasto verde per connetterti."
                 textSize = 11f
                 typeface = Typeface.MONOSPACE
@@ -129,7 +131,8 @@ object NetworksScreenBuilder {
                 setTextColor(Color.parseColor("#38BDF8"))
                 setPadding(18, 16, 18, 16)
             }
-            addView(activity.serverListLog)
+            activity.serverListLog = logView
+            addView(logView)
 
             addView(UiComponents.sectionTitle(activity, "Aggiungi Nuovo Server eD2K Manuale (IP:Porta)"))
             val addSrvRow = LinearLayout(activity).apply {
